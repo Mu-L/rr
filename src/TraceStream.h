@@ -38,6 +38,16 @@ struct WriteHole {
   uint64_t size;
 };
 
+enum class MemWriteSizeValidation {
+  /* A data record where we _know_ that this data was all written, and it
+   * _must_ be replicated in the replayed process in its entirety */
+  EXACT,
+  /* We recorded a range of memory that's a conservative over-estimate of
+    * what was actually written, and it might not replay cleanly in its
+    * entirety in a replayed process */
+  CONSERVATIVE,
+};
+
 /**
  * TraceStream stores all the data common to both recording and
  * replay.  TraceWriter deals with recording-specific logic, and
@@ -56,6 +66,7 @@ public:
     size_t size;
     pid_t rec_tid;
     std::vector<WriteHole> holes;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -224,13 +235,15 @@ public:
    * 'addr' is the address in the tracee where the data came from/will be
    * restored to.
    */
-  void write_raw(pid_t tid, const void* data, size_t len, remote_ptr<void> addr) {
+  void write_raw(pid_t tid, const void* data, size_t len, remote_ptr<void> addr,
+                 MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT) {
     write_raw_data(data, len);
-    write_raw_header(tid, len, addr, std::vector<WriteHole>());
+    write_raw_header(tid, len, addr, std::vector<WriteHole>(), size_validation);
   }
   void write_raw_data(const void* data, size_t len);
   void write_raw_header(pid_t tid, size_t total_len, remote_ptr<void> addr,
-                        const std::vector<WriteHole>& holes);
+                        const std::vector<WriteHole>& holes,
+                        MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
 
   /**
    * Write a task event (clone or exec record) to the trace.
@@ -325,6 +338,15 @@ private:
   bool chaos_mode;
 };
 
+struct TraceUtsName {
+  std::string sysname;
+  std::string nodename;
+  std::string release;
+  std::string version;
+  std::string machine;
+  std::string domainname;
+};
+
 class TraceReader : public TraceStream {
 public:
   /**
@@ -335,6 +357,7 @@ public:
     std::vector<uint8_t> data;
     remote_ptr<void> addr;
     pid_t rec_tid;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -345,6 +368,7 @@ public:
     remote_ptr<void> addr;
     pid_t rec_tid;
     std::vector<WriteHole> holes;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -380,12 +404,6 @@ public:
    * Sets |*time| (if non-null) to the global time of the event.
    */
   TraceTaskEvent read_task_event(FrameTime* time = nullptr);
-
-  /**
-   * Read the next raw data record for this frame and return it. Aborts if
-   * there are no more raw data records for this frame.
-   */
-  RawData read_raw_data();
 
   /**
    * Reads the next raw data record for last-read frame. If there are no more
@@ -468,6 +486,7 @@ public:
   // The base syscall number for rr syscalls in this trace
   int rrcall_base() const { return rrcall_base_; }
   uint32_t syscallbuf_fds_disabled_size() const { return syscallbuf_fds_disabled_size_; }
+  uint32_t syscallbuf_hdr_size() const { return syscallbuf_hdr_size_; }
 
   SupportedArch arch() const { return arch_; }
 
@@ -497,6 +516,8 @@ public:
 
   int required_forward_compatibility_version() const { return required_forward_compatibility_version_; }
 
+  const TraceUtsName& uname() const { return uname_; }
+
 private:
   CompressedReader& reader(Substream s) { return *readers[s]; }
   const CompressedReader& reader(Substream s) const { return *readers[s]; }
@@ -509,6 +530,7 @@ private:
   double monotonic_time_;
   std::unique_ptr<TraceUuid> uuid_;
   MemoryRange exclusion_range_;
+  TraceUtsName uname_;
   bool trace_uses_cpuid_faulting;
   bool preload_thread_locals_recorded_;
   bool clear_fip_fdp_;
@@ -516,13 +538,15 @@ private:
   bool chaos_mode_;
   int rrcall_base_;
   uint32_t syscallbuf_fds_disabled_size_;
+  uint32_t syscallbuf_hdr_size_;
   int required_forward_compatibility_version_;
   SupportedArch arch_;
   int quirks_;
 };
 
-extern std::string trace_save_dir();
-extern std::string resolve_trace_name(const std::string& trace_name);
+std::string trace_save_dir();
+std::string resolve_trace_name(const std::string& trace_name);
+std::string latest_trace_symlink();
 
 } // namespace rr
 

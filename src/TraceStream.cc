@@ -1,5 +1,10 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
+#ifndef _GNU_SOURCE
+// For utsname::domainname
+#define _GNU_SOURCE 1
+#endif
+
 #include "TraceStream.h"
 
 #include <capnp/message.h>
@@ -8,6 +13,7 @@
 #include <limits.h>
 #include <sched.h>
 #include <sys/file.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sysexits.h>
 #include <dirent.h>
@@ -25,6 +31,7 @@
 #include "TaskishUid.h"
 #include "core.h"
 #include "kernel_abi.h"
+#include "kernel_metadata.h"
 #include "kernel_supplement.h"
 #include "log.h"
 #include "preload/preload_interface.h"
@@ -118,7 +125,7 @@ string trace_save_dir() {
   return output_dir ? output_dir : default_rr_trace_dir();
 }
 
-static string latest_trace_symlink() {
+string latest_trace_symlink() {
   return trace_save_dir() + "/latest-trace";
 }
 
@@ -229,6 +236,9 @@ static kj::ArrayPtr<const capnp::byte> str_to_data(const string& str) {
 }
 
 static string data_to_str(const kj::ArrayPtr<const capnp::byte>& data) {
+  if (!data.begin()) {
+    return string();
+  }
   if (memchr(data.begin(), 0, data.size())) {
     FATAL() << "Invalid string: contains null character";
   }
@@ -336,18 +346,15 @@ static void to_trace_signal(trace::Signal::Builder signal, const Event& ev) {
 }
 
 static Event from_trace_signal(EventType type, trace::Signal::Reader signal) {
-  if (signal.getSiginfoArch() != to_trace_arch(NativeArch::arch())) {
-    // XXX if we want to handle consumption of rr traces created on a different
-    // architecture rr build than we're running now, we should convert siginfo
-    // formats here.
-    FATAL() << "Unsupported siginfo arch";
-  }
+  union {
+    NativeArch::siginfo_t native_siginfo;
+    siginfo_t system_siginfo;
+  } si;
   auto siginfo = signal.getSiginfo();
-  if (siginfo.size() != sizeof(siginfo_t)) {
-    FATAL() << "Bad siginfo";
-  }
+  si.native_siginfo = convert_to_native_siginfo(from_trace_arch(signal.getSiginfoArch()),
+      siginfo.begin(), siginfo.size());
   return Event(type,
-               SignalEvent(*reinterpret_cast<const siginfo_t*>(siginfo.begin()),
+               SignalEvent(si.system_siginfo,
                            signal.getDeterministic() ? DETERMINISTIC_SIG
                                                      : NONDETERMINISTIC_SIG,
                            from_trace_disposition(signal.getDisposition())));
@@ -415,6 +422,7 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
     w.setTid(r.rec_tid);
     w.setAddr(r.addr.as_int());
     w.setSize(r.size);
+    w.setSizeIsConservative(r.size_validation == MemWriteSizeValidation::CONSERVATIVE);
     auto holes = w.initHoles(r.holes.size());
     for (size_t j = 0; j < r.holes.size(); ++j) {
       holes[j].setOffset(r.holes[j].offset);
@@ -493,10 +501,12 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
       auto data = syscall.initExtra();
       if (e.write_offset >= 0) {
         data.setWriteOffset(e.write_offset);
-      } else if (e.exec_fds_to_close.size()) {
+      }
+      if (!e.exec_fds_to_close.empty()) {
         data.setExecFdsToClose(kj::ArrayPtr<const int>(
             e.exec_fds_to_close.data(), e.exec_fds_to_close.size()));
-      } else if (e.opened.size()) {
+      }
+      if (!e.opened.empty()) {
         auto open = data.initOpenedFds(e.opened.size());
         for (size_t i = 0; i < e.opened.size(); ++i) {
           auto o = open[i];
@@ -506,12 +516,22 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
           o.setDevice(opened.device);
           o.setInode(opened.inode);
         }
-      } else if (e.socket_addrs) {
+      }
+      if (e.socket_addrs) {
         auto addrs = data.initSocketAddrs();
         auto localAddr = (*e.socket_addrs.get())[0];
         auto remoteAddr = (*e.socket_addrs.get())[1];
         addrs.setLocalAddr(Data::Reader(reinterpret_cast<uint8_t*>(&localAddr), sizeof(localAddr)));
         addrs.setRemoteAddr(Data::Reader(reinterpret_cast<uint8_t*>(&remoteAddr), sizeof(remoteAddr)));
+      }
+      if (!e.madvise_ranges.empty()) {
+        auto ranges = data.initMadviseRanges(e.madvise_ranges.size());
+        for (size_t i = 0; i < e.madvise_ranges.size(); ++i) {
+          auto r = ranges[i];
+          auto mr = e.madvise_ranges[i];
+          r.setStart(mr.start().as_int());
+          r.setEnd(mr.end().as_int());
+        }
       }
       break;
     }
@@ -554,7 +574,8 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
       const auto& hole = holes[j];
       h[j] = { hole.getOffset(), hole.getSize() };
     }
-    raw_recs[i] = { w.getAddr(), (size_t)w.getSize(), i32_to_tid(w.getTid()), h };
+    raw_recs[i] = { w.getAddr(), (size_t)w.getSize(), i32_to_tid(w.getTid()), h,
+                    w.getSizeIsConservative() ? MemWriteSizeValidation::CONSERVATIVE : MemWriteSizeValidation::EXACT };
   }
 
   if (ret.global_time < skip_before) {
@@ -650,8 +671,10 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
       auto mprotect_records = event.getSyscallbufFlush().getMprotectRecords();
       auto& records = ret.ev.SyscallbufFlush().mprotect_records;
       records.resize(mprotect_records.size() / sizeof(mprotect_record));
-      memcpy(records.data(), mprotect_records.begin(),
-             records.size() * sizeof(mprotect_record));
+      if (records.data()) {
+        memcpy(records.data(), mprotect_records.begin(),
+               records.size() * sizeof(mprotect_record));
+      }
       break;
     }
     case trace::Frame::Event::SYSCALL: {
@@ -708,6 +731,16 @@ TraceFrame TraceReader::read_frame(FrameTime skip_before) {
           memcpy(&(*syscall_ev.socket_addrs.get())[1], remote.begin(), sizeof(NativeArch::sockaddr_storage));
           break;
         }
+        case trace::Frame::Event::Syscall::Extra::MADVISE_RANGES: {
+          auto mrs = data.getMadviseRanges();
+          syscall_ev.madvise_ranges.resize(mrs.size());
+          for (size_t i = 0; i < mrs.size(); ++i) {
+            const auto& mr = mrs[i];
+            syscall_ev.madvise_ranges[i] =
+                MemoryRange(remote_ptr<void>(mr.getStart()), remote_ptr<void>(mr.getEnd()));
+          }
+          break;
+        }
         default:
           FATAL() << "Unknown syscall type";
           break;
@@ -747,6 +780,9 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
       exec.setExeBase(event.exe_base().as_int());
       exec.setInterpBase(event.interp_base().as_int());
       exec.setInterpName(str_to_data(event.interp_name()));;
+      auto pac_data = exec.initPacData();
+      std::vector<uint8_t> pac_data_vec = event.pac_data();
+      pac_data.setRaw(Data::Reader(pac_data_vec.data(), pac_data_vec.size()));
       break;
     }
     case TraceTaskEvent::EXIT:
@@ -809,6 +845,8 @@ TraceTaskEvent TraceReader::read_task_event(FrameTime* time) {
       r.exe_base_ = exec.getExeBase();
       r.interp_base_ = exec.getInterpBase();
       r.interp_name_ = data_to_str(exec.getInterpName());
+      auto pac_data = exec.getPacData().getRaw();
+      r.pac_data_ = std::vector<uint8_t>(pac_data.begin(), pac_data.end());
       break;
     }
     case trace::TaskEvent::Which::EXIT:
@@ -1201,21 +1239,14 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
 
 void TraceWriter::write_raw_header(pid_t rec_tid, size_t total_len,
                                    remote_ptr<void> addr,
-                                   const std::vector<WriteHole>& holes = std::vector<WriteHole>()) {
-  raw_recs.push_back({ addr, total_len, rec_tid, holes });
+                                   const std::vector<WriteHole>& holes,
+                                   MemWriteSizeValidation size_validation) {
+  raw_recs.push_back({ addr, total_len, rec_tid, holes, size_validation });
 }
 
 void TraceWriter::write_raw_data(const void* d, size_t len) {
   auto& data = writer(RAW_DATA);
   data.write(d, len);
-}
-
-TraceReader::RawData TraceReader::read_raw_data() {
-  RawData d;
-  if (!read_raw_data_for_frame(d)) {
-    FATAL() << "Expected raw data, found none";
-  }
-  return d;
 }
 
 bool TraceReader::read_raw_data_for_frame(RawData& d) {
@@ -1225,6 +1256,7 @@ bool TraceReader::read_raw_data_for_frame(RawData& d) {
   auto& rec = raw_recs[raw_recs.size() - 1];
   d.rec_tid = rec.rec_tid;
   d.addr = rec.addr;
+  d.size_validation = rec.size_validation;
 
   d.data.resize(rec.size);
   auto hole_iter = rec.holes.begin();
@@ -1257,6 +1289,7 @@ bool TraceReader::read_raw_data_for_frame_with_holes(RawDataWithHoles& d) {
   d.addr = rec.addr;
   d.holes = std::move(rec.holes);
   size_t data_size = rec.size;
+  d.size_validation = rec.size_validation;
   for (auto& h : d.holes) {
     data_size -= h.size;
   }
@@ -1336,7 +1369,10 @@ TraceWriter::TraceWriter(const std::string& file_name,
       has_cpuid_faulting_(false),
       xsave_fip_fdp_quirk_(false),
       fdp_exception_only_quirk_(false),
-      clear_fip_fdp_(false) {
+      clear_fip_fdp_(false),
+      supports_file_data_cloning_(false),
+      chaos_mode(false)
+       {
   this->ticks_semantics_ = ticks_semantics_;
 
   for (Substream s = SUBSTREAM_FIRST; s < SUBSTREAM_COUNT; ++s) {
@@ -1414,6 +1450,7 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setPreloadThreadLocalsRecorded(true);
   header.setRrcallBase(syscall_number_for_rrcall_init_preload(x86_64));
   header.setSyscallbufFdsDisabledSize(SYSCALLBUF_FDS_DISABLED_SIZE);
+  header.setSyscallbufHdrSize(sizeof(syscallbuf_hdr));
 
   header.setNativeArch(to_trace_arch(NativeArch::arch()));
   if (NativeArch::is_x86ish())
@@ -1453,6 +1490,21 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setExclusionRangeEnd(exclusion_range.end().as_int());
   header.setRuntimePageSize(page_size());
   header.setPreloadLibraryPageSize(PRELOAD_LIBRARY_PAGE_SIZE);
+
+  {
+    struct utsname uname_buf;
+    int ret = uname(&uname_buf);
+    if (ret) {
+      FATAL() << "uname failed";
+    }
+    auto uname_msg = header.initUname();
+    uname_msg.setSysname(str_to_data(uname_buf.sysname));
+    uname_msg.setNodename(str_to_data(uname_buf.nodename));
+    uname_msg.setRelease(str_to_data(uname_buf.release));
+    uname_msg.setVersion(str_to_data(uname_buf.version));
+    uname_msg.setMachine(str_to_data(uname_buf.machine));
+    uname_msg.setDomainname(str_to_data(uname_buf.domainname));
+  }
 
   try {
     writePackedMessageToFd(version_fd, header_msg);
@@ -1600,6 +1652,7 @@ TraceReader::TraceReader(const string& dir)
   ticks_semantics_ = from_trace_ticks_semantics(header.getTicksSemantics());
   rrcall_base_ = header.getRrcallBase();
   syscallbuf_fds_disabled_size_ = header.getSyscallbufFdsDisabledSize();
+  syscallbuf_hdr_size_ = header.getSyscallbufHdrSize();
   required_forward_compatibility_version_ = header.getRequiredForwardCompatibilityVersion();
   quirks_ = 0;
   {
@@ -1660,6 +1713,14 @@ TraceReader::TraceReader(const string& dir)
   exclusion_range_ = MemoryRange(remote_ptr<void>(header.getExclusionRangeStart()),
                                  remote_ptr<void>(header.getExclusionRangeEnd()));
 
+  const auto& uname = header.getUname();
+  uname_.sysname = data_to_str(uname.getSysname());
+  uname_.nodename = data_to_str(uname.getNodename());
+  uname_.release = data_to_str(uname.getRelease());
+  uname_.version = data_to_str(uname.getVersion());
+  uname_.machine = data_to_str(uname.getMachine());
+  uname_.domainname = data_to_str(uname.getDomainname());
+
   // Set the global time at 0, so that when we tick it for the first
   // event, it matches the initial global time at recording, 1.
   global_time = 0;
@@ -1688,6 +1749,7 @@ TraceReader::TraceReader(const TraceReader& other)
   chaos_mode_ = other.chaos_mode_;
   chaos_mode_known_ = other.chaos_mode_known_;
   exclusion_range_ = other.exclusion_range_;
+  uname_ = other.uname_;
   quirks_ = other.quirks_;
   clear_fip_fdp_ = other.clear_fip_fdp_;
   required_forward_compatibility_version_ = other.required_forward_compatibility_version_;

@@ -66,11 +66,15 @@ RecordCommand RecordCommand::singleton(
     "  --syscall-buffer-sig=<NUM> the signal used for communication with the\n"
     "                             syscall buffer. SIGPWR by default, unused\n"
     "                             if --no-syscall-buffer is passed\n"
+    "  -s, --always-switch        Context-switch after every rr event\n"
+    "                             (mainly for testing)\n"
     "  -t, --continue-through-signal=<SIG>\n"
     "                             Unhandled <SIG> signals will be ignored\n"
     "                             instead of terminating the program. The\n"
     "                             signal will still be delivered for user\n"
     "                             handlers and debugging.\n"
+    "  --intel-pt                 Enable PT collection of control flow\n"
+    "                             (for debugging rr)\n"
     "  -u, --cpu-unbound          allow tracees to run on any virtual CPU.\n"
     "                             Default is to bind to a random CPU.  This "
     "option\n"
@@ -100,7 +104,9 @@ RecordCommand RecordCommand::singleton(
     "  --asan                     Override heuristics and always enable ASAN\n"
     "                             compatibility.\n"
     "  --tsan                     Override heuristics and always enable TSAN\n"
-    "                             compatibility.\n");
+    "                             compatibility.\n"
+    "  --check-outside-mmaps      Try to identify files that are mapped outside\n"
+    "                             of the trace and could cause diversions.\n");
 
 struct RecordFlags {
   vector<string> extra_env;
@@ -180,6 +186,13 @@ struct RecordFlags {
   /* True if we should always enable TSAN compatibility. */
   bool tsan;
 
+  /* True if we should enable collection of control flow
+     with PT. */
+  bool intel_pt;
+
+  /* True if we should check files being mapped outside of the recording. */
+  bool check_outside_mmaps;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -203,7 +216,9 @@ struct RecordFlags {
         stap_sdt(false),
         unmap_vdso(false),
         asan(false),
-        tsan(false) {}
+        tsan(false),
+        intel_pt(false),
+        check_outside_mmaps(false) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -265,6 +280,8 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 16, "disable-avx-512", NO_PARAMETER },
     { 17, "asan", NO_PARAMETER },
     { 18, "tsan", NO_PARAMETER },
+    { 19, "intel-pt", NO_PARAMETER },
+    { 20, "check-outside-mmaps", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
     { 'i', "ignore-signal", HAS_PARAMETER },
@@ -478,6 +495,12 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 18:
       flags.tsan = true;
       break;
+    case 19:
+      flags.intel_pt = true;
+      break;
+    case 20:
+      flags.check_outside_mmaps = true;
+      break;
     case 's':
       flags.always_switch = true;
       break;
@@ -534,7 +557,8 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
         did_print_reassurance = true;
         write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
       } else if (now - term_requested > RR_SIGKILL_GRACE_TIME + TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
-        notifying_abort();
+        errno = 0;
+        FATAL() << "SIGTERM grace period expired";
       }
     }
   } else {
@@ -547,10 +571,8 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
  * give a stacktrace.
  */
 static void handle_SIGSEGV(__attribute__((unused)) int sig) {
-  static const char msg[] =
-    "rr itself crashed (SIGSEGV). This shouldn't happen!\n";
-  write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
-  notifying_abort();
+  errno = 0;
+  FATAL() << "rr itself crashed (SIGSEGV). This shouldn't happen!";
 }
 
 static void install_signal_handlers(void) {
@@ -567,6 +589,10 @@ static void install_signal_handlers(void) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGABRT, &sa, nullptr);
   sigaction(SIGQUIT, &sa, nullptr);
+  sigaction(SIGTRAP, &sa, nullptr);
+  sigaction(SIGTTIN, &sa, nullptr);
+  sigaction(SIGTTOU, &sa, nullptr);
+  sigaction(SIGWINCH, &sa, nullptr);
 }
 
 static void setup_session_from_flags(RecordSession& session,
@@ -667,7 +693,8 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
       flags.use_syscall_buffer, flags.syscallbuf_desched_sig,
       flags.bind_cpu, flags.output_trace_dir,
       flags.trace_id.get(),
-      flags.stap_sdt, flags.unmap_vdso, flags.asan, flags.tsan);
+      flags.stap_sdt, flags.unmap_vdso, flags.asan, flags.tsan,
+      flags.intel_pt, flags.check_outside_mmaps);
   setup_session_from_flags(*session, flags);
 
   static_session = session.get();
@@ -791,6 +818,30 @@ static void reset_uid_sudo() {
   prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
 }
 
+static ScopedFd open_controlling_terminal_if_foreground_process_group_leader() {
+  char path[L_ctermid + 1];
+  ctermid(path);
+  ScopedFd terminal_fd(path, O_RDONLY);
+  if (terminal_fd.is_open()) {
+    pid_t fg_process_group = tcgetpgrp(terminal_fd);
+    if (fg_process_group != getpid()) {
+      terminal_fd.close();
+    }
+  }
+  return terminal_fd;
+}
+
+static void detach_teleport() {
+  int ret = syscall(SYS_rrcall_detach_teleport, (uintptr_t)0, (uintptr_t)0,
+    (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
+  if (ret < 0) {
+    FATAL() << "Failed to detach from parent rr";
+  }
+  if (running_under_rr(false)) {
+    FATAL() << "Detaching from parent rr did not work";
+  }
+}
+
 int RecordCommand::run(vector<string>& args) {
   RecordFlags flags;
   while (parse_record_arg(args, flags)) {
@@ -803,14 +854,28 @@ int RecordCommand::run(vector<string>& args) {
         return 1;
       case NESTED_DETACH:
       case NESTED_RELEASE: {
-        int ret = syscall(SYS_rrcall_detach_teleport, (uintptr_t)0, (uintptr_t)0,
-          (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
-        if (ret < 0) {
-          FATAL() << "Failed to detach from parent rr";
+        bool is_process_group_leader = getpgrp() == getpid();
+        ScopedFd terminal_fd = open_controlling_terminal_if_foreground_process_group_leader();
+
+        detach_teleport();
+
+        if (is_process_group_leader) {
+          setpgid(0, 0);
         }
-        if (running_under_rr(false)) {
-          FATAL() << "Detaching from parent rr did not work";
+        if (terminal_fd.is_open()) {
+          struct sigaction sa;
+          struct sigaction sa_old;
+          memset(&sa, 0, sizeof(sa));
+          sa.sa_handler = SIG_IGN;
+          // Ignore SIGTTOU while we change settings, we don't want it to stop us
+          sigaction(SIGTTOU, &sa, &sa_old);
+          int ret = tcsetpgrp(terminal_fd, getpid());
+          if (ret) {
+            LOG(warn) << "Failed to make ourselves the foreground process: " << errno_name(errno);
+          }
+          sigaction(SIGTTOU, &sa_old, nullptr);
         }
+
         if (flags.nested == NESTED_RELEASE) {
           exec_child(args);
           return 1;
@@ -838,7 +903,7 @@ int RecordCommand::run(vector<string>& args) {
   if (flags.setuid_sudo) {
     if (geteuid() != 0 || getenv("SUDO_UID") == NULL) {
       fprintf(stderr, "rr: --setuid-sudo option may only be used under sudo.\n"
-                      "Re-run as `sudo -EP --preserve-env=HOME rr record --setuid-sudo` to"
+                      "Re-run as `sudo -EP --preserve-env=HOME rr record --setuid-sudo` to "
                       "record privileged executables.\n");
       return 1;
     }

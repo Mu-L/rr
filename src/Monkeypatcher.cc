@@ -492,6 +492,11 @@ remote_code_ptr Monkeypatcher::get_jump_stub_exit_breakpoint(remote_code_ptr ip,
   return nullptr;
 }
 
+static bool hook_can_ignore_interfering_branches(const syscall_patch_hook& hook, size_t jump_patch_size) {
+  return hook.patch_region_length >= jump_patch_size &&
+    (hook.flags & (PATCH_IS_MULTIPLE_INSTRUCTIONS | PATCH_IS_NOP_INSTRUCTIONS)) == PATCH_IS_NOP_INSTRUCTIONS;
+}
+
 /**
  * Some functions make system calls while storing local variables in memory
  * below the stack pointer. We need to decrement the stack pointer by
@@ -522,7 +527,7 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
                                            remote_code_ptr ip_of_instruction,
                                            size_t instruction_length,
                                            uint32_t fake_syscall_number) {
-  uint8_t jump_patch[instruction_length + hook.patch_region_length];
+  size_t patch_region_size = instruction_length + hook.patch_region_length;
   // We're patching in a relative jump, so we need to compute the offset from
   // the end of the jump to our actual destination.
   remote_ptr<uint8_t> jump_patch_start = ip_of_instruction.to_data_ptr<uint8_t>();
@@ -531,7 +536,7 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   }
   remote_ptr<uint8_t> jump_patch_end = jump_patch_start + JumpPatch::size;
   remote_ptr<uint8_t> return_addr =
-    jump_patch_start + instruction_length + hook.patch_region_length;
+    jump_patch_start + patch_region_size;
 
   remote_ptr<uint8_t> extended_jump_start;
   if (fake_syscall_number) {
@@ -574,10 +579,20 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
 
   // pad with NOPs to the next instruction
   static const uint8_t NOP = 0x90;
-  memset(jump_patch, NOP, sizeof(jump_patch));
-  JumpPatch::substitute(jump_patch, jump_offset32);
+  vector<uint8_t> jump_patch;
+  jump_patch.resize(patch_region_size, NOP);
+  if (hook_can_ignore_interfering_branches(hook, JumpPatch::size)) {
+    // If the preceding instruction is long enough to contain the entire jump,
+    // and is a nop, replace the original instruction by a jump back to the
+    // start of the patch region. This allows us to ignore (likely spurious,
+    // but nevertheless), interfering branches, because whether we jump to the
+    // instruction or the start of the patch region, the effect is the same.
+    jump_patch[patch_region_size-2] = 0xeb; // jmp rel
+    jump_patch[patch_region_size-1] = (int8_t)-patch_region_size;
+  }
+  JumpPatch::substitute(jump_patch.data(), jump_offset32);
   bool ok = true;
-  write_and_record_bytes(t, jump_patch_start, sizeof(jump_patch), jump_patch, &ok);
+  write_and_record_bytes(t, jump_patch_start, jump_patch.size(), jump_patch.data(), &ok);
   if (!ok) {
     LOG(warn) << "Couldn't write patch; errno=" << errno;
   }
@@ -884,7 +899,7 @@ static string bytes_to_string(uint8_t* bytes, size_t size) {
 
 static bool task_safe_for_syscall_patching(RecordTask* t, remote_code_ptr start,
                                            remote_code_ptr end) {
-  if (!t->is_running()) {
+  if (t->is_stopped()) {
     remote_code_ptr ip = t->ip();
     if (start <= ip && ip < end) {
       return false;
@@ -951,10 +966,24 @@ bool Monkeypatcher::try_patch_vsyscall_caller(RecordTask* t, remote_code_ptr ret
   return true;
 }
 
+static uint64_t jump_patch_size(SupportedArch arch)
+{
+  switch (arch) {
+    case x86: return X86SysenterVsyscallSyscallHook::size;
+    case x86_64: return X64JumpMonkeypatch::size;
+    case aarch64: return 2*rr::syscall_instruction_length(arch);
+    default:
+      FATAL() << "Unimplemented for this architecture";
+      return 0;
+  }
+}
+
 const syscall_patch_hook* Monkeypatcher::find_syscall_hook(RecordTask* t,
                                                            remote_code_ptr ip,
                                                            bool entering_syscall,
-                                                           size_t instruction_length) {
+                                                           size_t instruction_length,
+                                                           bool &should_retry,
+                                                           bool &transient_failure) {
   /* we need to inspect this many bytes before the start of the instruction,
      to find every short jump that might land after it. Conservative. */
   static const intptr_t LOOK_BACK = 0x80;
@@ -1008,9 +1037,9 @@ const syscall_patch_hook* Monkeypatcher::find_syscall_hook(RecordTask* t,
         // A patch that uses bytes before the syscall can't be done when
         // entering the syscall, it must be done when exiting. So set a flag on
         // the Task that tells us to come back later.
-        t->retry_syscall_patching = true;
+        should_retry = true;
         LOG(debug) << "Deferring syscall patching at " << ip << " in " << t
-                   << " until syscall exit.";
+                  << " until syscall exit.";
         return nullptr;
       }
       matches_hook = true;
@@ -1020,53 +1049,83 @@ const syscall_patch_hook* Monkeypatcher::find_syscall_hook(RecordTask* t,
       continue;
     }
 
-    // Search for a following short-jump instruction that targets an
-    // instruction
-    // after the syscall. False positives are OK.
-    // glibc-2.23.1-8.fc24.x86_64's __clock_nanosleep needs this.
-    bool found_potential_interfering_branch = false;
-    for (size_t i = buf_valid_start_offset; i + 2 <= buf_valid_end_offset; ++i) {
-      uint8_t b = bytes[i];
-      // Check for short conditional or unconditional jump
-      if (b == 0xeb || (b >= 0x70 && b < 0x80)) {
-        int offset_from_instruction_end = (int)i + 2 + (int8_t)bytes[i + 1] -
-            (LOOK_BACK + instruction_length);
-        if ((hook.flags & PATCH_IS_MULTIPLE_INSTRUCTIONS)
-                ? (offset_from_instruction_end >= 0 && offset_from_instruction_end < hook.patch_region_length)
-                : offset_from_instruction_end == 0) {
-          LOG(debug) << "Found potential interfering branch at "
-                      << ip.to_data_ptr<uint8_t>() - LOOK_BACK + i;
-          // We can't patch this because it would jump straight back into
-          // the middle of our patch code.
-          found_potential_interfering_branch = true;
-          break;
+    if (!hook_can_ignore_interfering_branches(hook, jump_patch_size(t->arch()))) {
+      // Search for a following short-jump instruction that targets an
+      // instruction
+      // after the syscall. False positives are OK.
+      // glibc-2.23.1-8.fc24.x86_64's __clock_nanosleep needs this.
+      bool found_potential_interfering_branch = false;
+      for (size_t i = buf_valid_start_offset; i + 2 <= buf_valid_end_offset; ++i) {
+        uint8_t b = bytes[i];
+        // Check for short conditional or unconditional jump
+        int branch_instruction_len = 0;
+        int32_t branch_offset = 0;
+        if (b == 0xeb || b == 0xe3 || (b >= 0x70 && b < 0x80)) {
+          branch_instruction_len = 2;
+          branch_offset = (int8_t)bytes[i + 1];
+        } else if (b == 0x0f && i + 6 <= buf_valid_end_offset &&
+                   (bytes[i + 1] >= 0x80 && bytes[i + 1] < 0x90)) {
+          branch_instruction_len = 6;
+          memcpy(&branch_offset, bytes + i + 2, 4);
+        }
+        if (branch_instruction_len) {
+          int offset_from_instruction_end = (int)i + branch_instruction_len +
+              branch_offset - (LOOK_BACK + instruction_length);
+          if (hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) {
+            if (hook.flags & PATCH_IS_MULTIPLE_INSTRUCTIONS) {
+              found_potential_interfering_branch =
+                offset_from_instruction_end <= -(ssize_t)instruction_length &&
+                offset_from_instruction_end > -(ssize_t)(instruction_length + hook.patch_region_length);
+            } else {
+              found_potential_interfering_branch = offset_from_instruction_end == -(ssize_t)instruction_length;
+            }
+          } else {
+            if (hook.flags & PATCH_IS_MULTIPLE_INSTRUCTIONS) {
+              found_potential_interfering_branch =
+                offset_from_instruction_end >= 0 && offset_from_instruction_end < hook.patch_region_length;
+            } else {
+              found_potential_interfering_branch = offset_from_instruction_end == 0;
+            }
+          }
+          if (found_potential_interfering_branch) {
+            LOG(debug) << "Found potential interfering branch at "
+                        << ip.to_data_ptr<uint8_t>() - LOOK_BACK + i;
+            break;
+          }
         }
       }
+      if (found_potential_interfering_branch) {
+        continue;
+      }
     }
 
-    if (!found_potential_interfering_branch) {
-      remote_code_ptr start_range, end_range;
-      if (hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) {
-        start_range = ip - hook.patch_region_length;
-        end_range = ip + instruction_length;
-      } else {
-        start_range = ip;
-        end_range = ip + instruction_length + hook.patch_region_length;
-      }
-      if (!safe_for_syscall_patching(start_range, end_range, t)) {
-        LOG(debug)
-            << "Temporarily declining to patch syscall at " << ip
-            << " because a different task has its ip in the patched range";
-        return nullptr;
-      }
-      LOG(debug) << "Trying to patch bytes "
-                 << bytes_to_string(
-                      following_bytes,
-                      min<size_t>(following_bytes_count,
-                          sizeof(syscall_patch_hook::patch_region_bytes)));
-
-      return &hook;
+    remote_code_ptr start_range, end_range;
+    if (hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) {
+      start_range = ip - hook.patch_region_length;
+      // if a thread has its RIP at the end of our range,
+      // it could be immediately after a syscall instruction that
+      // will need to be restarted. Patching out that instruction will
+      // prevent the kernel from restarting it. So, extend our range by
+      // one byte to detect such threads.
+      end_range = ip + instruction_length + 1;
+    } else {
+      start_range = ip;
+      end_range = ip + instruction_length + hook.patch_region_length;
     }
+    if (!safe_for_syscall_patching(start_range, end_range, t)) {
+      transient_failure = true;
+      LOG(debug)
+          << "Temporarily declining to patch syscall at " << ip
+          << " because a different task has its ip in the patched range";
+      return nullptr;
+    }
+    LOG(debug) << "Trying to patch bytes "
+              << bytes_to_string(
+                    following_bytes,
+                    min<size_t>(following_bytes_count,
+                        sizeof(syscall_patch_hook::patch_region_bytes)));
+
+    return &hook;
   }
 
   LOG(debug) << "Failed to find a syscall hook for bytes "
@@ -1085,18 +1144,18 @@ const syscall_patch_hook* Monkeypatcher::find_syscall_hook(RecordTask* t,
 // The `entering_syscall` flag tells us whether or not we're at syscall entry.
 // If we are, and we find a pattern that can only be patched at exit, we'll
 // set a flag on the RecordTask telling it to try again after syscall exit.
-bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, bool entering_syscall,
-                                             SupportedArch arch) {
-  Registers r = t->regs();
-  remote_code_ptr ip = r.ip();
-
+bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, remote_code_ptr ip, bool entering_syscall,
+                                             SupportedArch arch, bool &should_retry) {
   ASSERT(t, is_x86ish(arch)) << "Unsupported architecture";
 
   size_t instruction_length = rr::syscall_instruction_length(arch);
+  bool transient_failure = false;
   const syscall_patch_hook* hook_ptr = find_syscall_hook(t, ip - instruction_length,
-      entering_syscall, instruction_length);
+      entering_syscall, instruction_length, should_retry, transient_failure);
   bool success = false;
-  intptr_t syscallno = r.original_syscallno();
+  // `syscallno` isn't necessarily correct here (in the extremely rare corner case that we
+  // deferred a patch and the signal handler changed it), but we only use it for logging.
+  intptr_t syscallno = t->regs().original_syscallno();
   if (hook_ptr) {
     // Get out of executing the current syscall before we patch it.
     if (entering_syscall && !t->exit_syscall_and_prepare_restart()) {
@@ -1114,7 +1173,7 @@ bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, bool entering_syscal
   }
 
   if (!success) {
-    if (!t->retry_syscall_patching) {
+    if (!should_retry && !transient_failure) {
       LOG(debug) << "Failed to patch syscall at " << ip << " syscall "
                  << syscall_name(syscallno, t->arch()) << " tid " << t->tid;
       tried_to_patch_syscall_addresses.insert(ip);
@@ -1125,15 +1184,12 @@ bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, bool entering_syscal
   return true;
 }
 
-bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_syscall) {
-  Registers r = t->regs();
-  remote_code_ptr ip = r.ip() - 4;
-
+bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, remote_code_ptr ip, bool entering_syscall) {
   uint32_t inst[2] = {0, 0};
-  size_t bytes_count = t->read_bytes_fallible(ip.to_data_ptr<uint8_t>() - 4, 8, &inst);
+  size_t bytes_count = t->read_bytes_fallible(ip.to_data_ptr<uint8_t>() - 8, 8, &inst);
   if (bytes_count < sizeof(inst) || inst[1] != 0xd4000001) {
     LOG(debug) << "Declining to patch syscall at "
-               << ip << " for unexpected instruction";
+               << ip - 4 << " for unexpected instruction";
     tried_to_patch_syscall_addresses.insert(ip);
     return false;
   }
@@ -1145,7 +1201,7 @@ bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_sysca
     // Our syscall hook cannot do that so this would have to be a raw syscall.
     // We can handle this at runtime but if we know the call is definitely
     // a clone we can avoid patching it here.
-    LOG(debug) << "Declining to patch clone syscall at " << ip;
+    LOG(debug) << "Declining to patch clone syscall at " << ip - 4;
     tried_to_patch_syscall_addresses.insert(ip);
     return false;
   }
@@ -1154,9 +1210,9 @@ bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_sysca
              memcmp(syscall_hooks[0].patch_region_bytes, &inst[1], 4) == 0))
     << "Unknown syscall hook";
 
-  if (!safe_for_syscall_patching(ip, ip + 4, t)) {
+  if (!safe_for_syscall_patching(ip - 4, ip, t)) {
     LOG(debug)
-      << "Temporarily declining to patch syscall at " << ip
+      << "Temporarily declining to patch syscall at " << ip - 4
       << " because a different task has its ip in the patched range";
     return false;
   }
@@ -1166,18 +1222,20 @@ bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_sysca
     return false;
   }
 
-  LOG(debug) << "Patching syscall at " << ip << " syscall "
-             << syscall_name(r.original_syscallno(), aarch64) << " tid " << t->tid;
+  LOG(debug) << "Patching syscall at " << ip - 4 << " syscall "
+             << syscall_name(t->regs().original_syscallno(), aarch64) << " tid " << t->tid;
 
-  auto success = patch_syscall_with_hook(*this, t, syscall_hooks[0], ip, 4, 0);
+  auto success = patch_syscall_with_hook(*this, t, syscall_hooks[0], ip - 4, 4, 0);
   if (!success && entering_syscall) {
     // Need to reenter the syscall to undo exit_syscall_and_prepare_restart
-    t->enter_syscall();
+    if (!t->enter_syscall()) {
+      return false;
+    }
   }
 
   if (!success) {
-    LOG(debug) << "Failed to patch syscall at " << ip << " syscall "
-               << syscall_name(r.original_syscallno(), aarch64) << " tid " << t->tid;
+    LOG(debug) << "Failed to patch syscall at " << ip - 4 << " syscall "
+               << syscall_name(t->regs().original_syscallno(), aarch64) << " tid " << t->tid;
     tried_to_patch_syscall_addresses.insert(ip);
     return false;
   }
@@ -1185,7 +1243,14 @@ bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_sysca
   return true;
 }
 
-bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
+
+bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry) {
+  Registers r = t->regs();
+  remote_code_ptr ip = r.ip();
+  return try_patch_syscall(t, entering_syscall, should_retry, ip);
+}
+
+bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry, remote_code_ptr ip) {
   if (syscall_hooks.empty()) {
     // Syscall hooks not set up yet. Don't spew warnings, and don't
     // fill tried_to_patch_syscall_addresses with addresses that we might be
@@ -1203,14 +1268,12 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
     return false;
   }
 
-  Registers r = t->regs();
-  remote_code_ptr ip = r.ip();
   // We should not get here for untraced syscalls or anything else from the rr page.
   // These should be normally prevented by our seccomp filter
   // and in the case of syscalls interrupted by signals,
   // the check for the syscall restart should prevent us from reaching here.
-  DEBUG_ASSERT(ip.to_data_ptr<void>() < AddressSpace::rr_page_start() ||
-               ip.to_data_ptr<void>() >= AddressSpace::rr_page_end());
+  ASSERT(t, ip.to_data_ptr<void>() < AddressSpace::rr_page_start() ||
+            ip.to_data_ptr<void>() >= AddressSpace::rr_page_end());
   if (tried_to_patch_syscall_addresses.count(ip) || is_jump_stub_instruction(ip, true)) {
     return false;
   }
@@ -1238,15 +1301,20 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
   // We want our mmap records to be associated with the next (PATCH_SYSCALL)
   // event, not a FLUSH_SYSCALLBUF event.
   t->maybe_flush_syscallbuf();
+  if (!t->is_stopped()) {
+    // Tracee was unexpectedly kicked out of a ptrace-stop by SIGKILL or
+    // equivalent. Abort trying to patch.
+    return false;
+  }
 
   if (arch == aarch64) {
-    return try_patch_syscall_aarch64(t, entering_syscall);
+    return try_patch_syscall_aarch64(t, ip, entering_syscall);
   }
-  return try_patch_syscall_x86ish(t, entering_syscall, arch);
+  return try_patch_syscall_x86ish(t, ip, entering_syscall, arch, should_retry);
 }
 
 bool Monkeypatcher::try_patch_trapping_instruction(RecordTask* t, size_t instruction_length,
-                                                   bool before_instruction) {
+                                                   bool before_instruction, bool &should_retry) {
   if (syscall_hooks.empty()) {
     // Syscall hooks not set up yet. Don't spew warnings, and don't
     // fill tried_to_patch_syscall_addresses with addresses that we might be
@@ -1269,8 +1337,9 @@ bool Monkeypatcher::try_patch_trapping_instruction(RecordTask* t, size_t instruc
   // event, not a FLUSH_SYSCALLBUF event.
   t->maybe_flush_syscallbuf();
 
+  bool transient_failure = false;
   const syscall_patch_hook* hook_ptr =
-    find_syscall_hook(t, ip_of_instruction, before_instruction, instruction_length);
+    find_syscall_hook(t, ip_of_instruction, before_instruction, instruction_length, should_retry, transient_failure);
   bool success = false;
   if (hook_ptr) {
     LOG(debug) << "Patching trapping instruction at " << ip_of_instruction << " tid " << t->tid;
@@ -1280,7 +1349,7 @@ bool Monkeypatcher::try_patch_trapping_instruction(RecordTask* t, size_t instruc
   }
 
   if (!success) {
-    if (!t->retry_syscall_patching) {
+    if (!should_retry && !transient_failure) {
       LOG(debug) << "Failed to patch trapping instruction at " << ip_of_instruction << " tid " << t->tid;
       tried_to_patch_syscall_addresses.insert(ip_of_instruction + instruction_length);
     }
@@ -1453,12 +1522,11 @@ static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
  * register so that CPU-specific behaviors involving that register don't leak
  * into stack memory.
  */
-static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
-                                     RecordTask* t, ElfReader& reader,
-                                     uintptr_t elf_addr,
-                                     remote_ptr<void> map_start,
-                                     size_t map_size,
-                                     size_t map_offset) {
+void Monkeypatcher::patch_dl_runtime_resolve(RecordTask* t, ElfReader& reader,
+                                             uintptr_t elf_addr,
+                                             remote_ptr<void> map_start,
+                                             size_t map_size,
+                                             size_t map_offset) {
   if (t->arch() != x86_64) {
     return;
   }
@@ -1472,39 +1540,27 @@ static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
   uint8_t *impl_start = impl;
   t->read_bytes(addr, impl);
   if (X64EndBr::match(impl) || X86EndBr::match(impl)) {
-    assert(X64EndBr::size == X86EndBr::size);
+    static_assert(X64EndBr::size == X86EndBr::size, "EndBr patch size mismatch");
     LOG(debug) << "Starts with endbr, skipping";
     addr += X64EndBr::size;
     impl_start += X64EndBr::size;
   }
 
+  static_assert(X64DLRuntimeResolve::size == X64DLRuntimeResolve2::size,
+                "DLRuntimeResolve patch size mismatch");
   if (!X64DLRuntimeResolve::match(impl_start) &&
       !X64DLRuntimeResolve2::match(impl_start)) {
     LOG(warn) << "_dl_runtime_resolve implementation doesn't look right";
     return;
   }
 
-  uint8_t call_patch[X64CallMonkeypatch::size];
-  // We're patching in a relative call, so we need to compute the offset from
-  // the end of the call to our actual destination.
+  vector<uint8_t> bytes(impl_start, impl_start + X64DLRuntimeResolve::size);
   auto call_patch_start = addr.cast<uint8_t>();
-  auto call_patch_end = call_patch_start + sizeof(call_patch);
+  saved_dl_runtime_resolve_code[call_patch_start] = std::move(bytes);
 
-  remote_ptr<uint8_t> extended_call_start =
-      allocate_extended_jump_x86ish<X64DLRuntimeResolvePrelude>(
-          t, patcher.extended_jump_pages, call_patch_end);
-  if (extended_call_start.is_null()) {
-    return;
-  }
-  uint8_t stub_patch[X64DLRuntimeResolvePrelude::size];
-  X64DLRuntimeResolvePrelude::substitute(stub_patch);
-  write_and_record_bytes(t, extended_call_start, stub_patch);
-
-  intptr_t call_offset = extended_call_start - call_patch_end;
-  int32_t call_offset32 = (int32_t)call_offset;
-  ASSERT(t, call_offset32 == call_offset)
-      << "allocate_extended_jump_x86ish didn't work";
-  X64CallMonkeypatch::substitute(call_patch, call_offset32);
+  uint8_t call_patch[X64AbsoluteIndirectCallMonkeypatch::size];
+  X64AbsoluteIndirectCallMonkeypatch::substitute(call_patch,
+      RR_DL_RUNTIME_RESOLVE_CLEAR_FIP);
   write_and_record_bytes(t, call_patch_start, call_patch);
 
   // pad with NOPs to the next instruction
@@ -1513,6 +1569,28 @@ static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
   memset(nops, NOP, sizeof(nops));
   write_and_record_mem(t, call_patch_start + sizeof(call_patch), nops,
                        sizeof(nops));
+}
+
+void Monkeypatcher::unpatch_dl_runtime_resolves(RecordTask* t) {
+  for (auto entry : saved_dl_runtime_resolve_code) {
+    remote_ptr<uint8_t> addr = entry.first;
+    uint8_t impl[X64DLRuntimeResolve::size];
+    bool ok = true;
+    t->read_bytes_helper(addr, sizeof(impl), impl, &ok);
+    if (!ok) {
+      LOG(warn) << "dl_runtime_resolve code has gone!";
+      continue;
+    }
+    uint8_t call_patch[X64AbsoluteIndirectCallMonkeypatch::size];
+    X64AbsoluteIndirectCallMonkeypatch::substitute(call_patch,
+      RR_PAGE_ADDR - PRELOAD_LIBRARY_PAGE_SIZE);
+    if (memcmp(impl, call_patch, sizeof(call_patch))) {
+      LOG(warn) << "dl_runtime_resolve code has changed!";
+      continue;
+    }
+    write_and_record_mem(t, addr, entry.second.data(), entry.second.size());
+  }
+  saved_dl_runtime_resolve_code.clear();
 }
 
 static bool file_may_need_instrumentation(const AddressSpace::Mapping& map) {
@@ -1594,7 +1672,7 @@ void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
           (syms.is_name(i, "_dl_runtime_resolve_fxsave") ||
            syms.is_name(i, "_dl_runtime_resolve_xsave") ||
            syms.is_name(i, "_dl_runtime_resolve_xsavec"))) {
-        patch_dl_runtime_resolve(*this, t, reader, syms.addr(i), start, size,
+        patch_dl_runtime_resolve(t, reader, syms.addr(i), start, size,
                                  offset_bytes);
       }
     }

@@ -14,6 +14,7 @@
 
 namespace rr {
 
+class ElfReader;
 class RecordTask;
 class ScopedFd;
 class Task;
@@ -62,10 +63,12 @@ public:
    * Zero or more mapping operations are also recorded to the trace and must
    * be replayed.
    */
-  bool try_patch_syscall(RecordTask* t, bool entering_syscall = true);
-  bool try_patch_syscall_x86ish(RecordTask* t, bool entering_syscall,
-                                SupportedArch arch);
-  bool try_patch_syscall_aarch64(RecordTask* t, bool entering_syscall);
+  bool try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry);
+  bool try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry, remote_code_ptr ip);
+
+  bool try_patch_syscall_x86ish(RecordTask* t, remote_code_ptr ip, bool entering_syscall,
+                                SupportedArch arch, bool &should_retry);
+  bool try_patch_syscall_aarch64(RecordTask* t, remote_code_ptr ip, bool entering_syscall);
 
   /**
    * Try to patch the trapping instruction that |t| just trapped on. If this
@@ -77,7 +80,8 @@ public:
    * be replayed.
    */
   bool try_patch_trapping_instruction(RecordTask* t, size_t instruction_length,
-                                      bool before_instruction = true);
+                                      bool before_instruction,
+                                      bool &should_retry);
 
   /**
    * Replace all extended jumps by syscalls again. Note that we do not try to
@@ -131,6 +135,8 @@ public:
   // if we are on the exit path in the jump stub
   remote_code_ptr get_jump_stub_exit_breakpoint(remote_code_ptr ip, RecordTask *t);
 
+  void unpatch_dl_runtime_resolves(RecordTask* t);
+
   struct patched_syscall {
     // Pointer to hook inside the syscall_hooks array, which gets initialized
     // once and is fixed afterwards.
@@ -146,13 +152,21 @@ public:
   std::map<remote_ptr<uint8_t>, patched_syscall> syscallbuf_stubs;
 
 private:
+  void patch_dl_runtime_resolve(RecordTask* t, ElfReader& reader,
+                                uintptr_t elf_addr,
+                                remote_ptr<void> map_start,
+                                size_t map_size,
+                                size_t map_offset);
+
   /**
    * `ip` is the address of the instruction that triggered the syscall or trap
    */
   const syscall_patch_hook* find_syscall_hook(RecordTask* t,
                                               remote_code_ptr ip,
                                               bool entering_syscall,
-                                              size_t instruction_length);
+                                              size_t instruction_length,
+                                              bool &should_retry,
+                                              bool &transient_failure);
 
   /**
    * The list of supported syscall patches obtained from the preload
@@ -165,6 +179,8 @@ private:
    * instructions that we've tried (or are currently trying) to patch.
    */
   std::unordered_set<remote_code_ptr> tried_to_patch_syscall_addresses;
+
+  std::map<remote_ptr<uint8_t>, std::vector<uint8_t>> saved_dl_runtime_resolve_code;
 };
 
 } // namespace rr

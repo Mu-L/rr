@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/perf_event.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +15,19 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
+
+#ifdef BPF
+#include <bpf/libbpf.h>
+#include <linux/hw_breakpoint.h>
+#endif
 
 #include <algorithm>
 #include <fstream>
 #include <limits>
 #include <regex>
 #include <string>
+#include <unordered_set>
 
 #include "Flags.h"
 #include "Session.h"
@@ -50,6 +58,7 @@ struct perf_event_attrs {
   const char *pmu_name = nullptr;
   uint32_t pmu_flags = 0;
   uint32_t skid_size = 0;
+  uint32_t ticks_min_period = 1;
   bool checked = false;
   bool has_ioc_period_bug = false;
   bool only_one_counter = false;
@@ -61,9 +70,24 @@ static uint32_t pmu_semantics_flags;
 
 /*
  * Find out the cpu model using the cpuid instruction.
- * Full list of CPUIDs at http://sandpile.org/x86/cpuid.htm
- * Another list at
- * http://software.intel.com/en-us/articles/intel-architecture-and-processor-identification-with-cpuid-model-and-family-numbers
+ *
+ * A 3rd party list of CPUIDs at https://sandpile.org/x86/cpuid.htm
+ *
+ * Intel's up-to-date and complete list is in
+ * "Volume 4: Model-Specific Registers", Chapter 2.
+ * See "Intel 64 and IA-32 Architectures Software Developer Manual"
+ * https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+ *
+ * Alternatively you can find the recently added CPUIDs in the lighter document
+ * called "Documentation Changes", navigate in table of contents to
+ * "27. Updates to Chapter 2, Volume 4"
+ * and then "Chapter 2 Model-Specific Registers (MSRs)"
+ *
+ * AMD: your best bet is https://www.amd.com/en/search/documentation/hub.html
+ * Search for "revision guide Family 17h" and "Model 31h" or "Models 00h-0Fh"
+ * For example "Revision Guide for AMD Family 19h Models 00h-0Fh Processors"
+ * has a "Table 2" with "CPUID Values for AMD" showing the specific model and
+ * revisions.
  */
 enum CpuMicroarch {
   UnknownCpu,
@@ -79,6 +103,7 @@ enum CpuMicroarch {
   IntelSkylake,
   IntelSilvermont,
   IntelGoldmont,
+  IntelTremont,
   IntelKabylake,
   IntelCometlake,
   IntelIcelake,
@@ -86,25 +111,39 @@ enum CpuMicroarch {
   IntelRocketlake,
   IntelAlderlake,
   IntelRaptorlake,
-  LastIntel = IntelRaptorlake,
+  IntelSapphireRapid,
+  IntelEmeraldRapid,
+  IntelMeteorLake,
+  LastIntel = IntelMeteorLake,
   FirstAMD,
-  AMDF15R30 = FirstAMD,
+  AMDF15 = FirstAMD,
   AMDZen,
-  LastAMD = AMDZen,
+  AMDZen2,
+  AMDZen3,
+  AMDZen4,
+  AMDZen5,
+  LastAMD = AMDZen5,
   FirstARM,
   ARMNeoverseN1 = FirstARM,
+  ARMNeoverseN2,
+  ARMNeoverseN3,
   ARMNeoverseE1,
   ARMNeoverseV1,
-  ARMNeoverseN2,
+  ARMNeoverseV2,
+  ARMNeoverseV3AE,
+  ARMNeoverseV3,
   ARMCortexA55,
   ARMCortexA75,
   ARMCortexA76,
   ARMCortexA77,
   ARMCortexA78,
   ARMCortexX1,
+  AmpereOne,
   AppleM1Icestorm,
   AppleM1Firestorm,
-  LastARM = AppleM1Firestorm,
+  AppleM2Blizzard,
+  AppleM2Avalanche,
+  LastARM = AppleM2Avalanche,
 };
 
 /*
@@ -128,6 +167,12 @@ enum CpuMicroarch {
  * (excluding interrupts, far branches, and rets).
  */
 #define PMU_TICKS_TAKEN_BRANCHES (1<<3)
+
+/*
+ * Set if this CPU is known to have essentially unbounded skid,
+ * i.e. the provided skid value is exceeded in rare cases.
+ */
+#define PMU_SKID_UNBOUNDED (1<<4)
 
 struct PmuConfig {
   CpuMicroarch uarch;
@@ -155,6 +200,9 @@ struct PmuConfig {
 // See Intel 64 and IA32 Architectures Performance Monitoring Events.
 // See check_events from libpfm4.
 static const PmuConfig pmu_configs[] = {
+  { IntelEmeraldRapid, "Intel EmeraldRapid", 0x5111c4, 0, 0, 125, PMU_TICKS_RCB },
+  { IntelSapphireRapid, "Intel SapphireRapid", 0x5111c4, 0, 0, 125, PMU_TICKS_RCB },
+  { IntelMeteorLake, "Intel Meteorlake", 0x5111c4, 0, 0, 125, PMU_TICKS_RCB },
   { IntelRaptorlake, "Intel Raptorlake", 0x5111c4, 0, 0, 125, PMU_TICKS_RCB },
   { IntelAlderlake, "Intel Alderlake", 0x5111c4, 0, 0, 125, PMU_TICKS_RCB },
   { IntelRocketlake, "Intel Rocketlake", 0x5111c4, 0, 0, 100, PMU_TICKS_RCB },
@@ -164,6 +212,7 @@ static const PmuConfig pmu_configs[] = {
   { IntelKabylake, "Intel Kabylake", 0x5101c4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelGoldmont, "Intel Goldmont", 0x517ec4, 0, 0, 100, PMU_TICKS_RCB },
+  { IntelTremont, "Intel Tremont", 0x517ec4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelSkylake, "Intel Skylake", 0x5101c4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelHaswell, "Intel Haswell", 0x5101c4, 0, 0, 100, PMU_TICKS_RCB },
@@ -173,11 +222,15 @@ static const PmuConfig pmu_configs[] = {
   { IntelWestmere, "Intel Westmere", 0x5101c4, 0, 0, 100, PMU_TICKS_RCB },
   { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, 0 },
   { IntelMerom, "Intel Merom", 0, 0, 0, 100, 0 },
-  { AMDF15R30, "AMD Family 15h Revision 30h", 0xc4, 0xc6, 0, 250, PMU_TICKS_TAKEN_BRANCHES },
+  { AMDF15, "AMD Family 15h", 0xc4, 0xc6, 0, 250, PMU_TICKS_TAKEN_BRANCHES },
   // 0xd1 == RETIRED_CONDITIONAL_BRANCH_INSTRUCTIONS - Number of retired conditional branch instructions
   // 0x2c == INTERRUPT_TAKEN - Counts the number of interrupts taken
-  // Both counters are available on Zen, Zen+ and Zen2.
-  { AMDZen, "AMD Zen", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB },
+  // Both counters are available on all Zen microarchitecures so far.
+  { AMDZen, "AMD Zen", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB | PMU_SKID_UNBOUNDED },
+  { AMDZen2, "AMD Zen 2", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB | PMU_SKID_UNBOUNDED },
+  { AMDZen3, "AMD Zen 3", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB | PMU_SKID_UNBOUNDED },
+  { AMDZen4, "AMD Zen 4", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB | PMU_SKID_UNBOUNDED },
+  { AMDZen5, "AMD Zen 5", 0x5100d1, 0, 0, 10000, PMU_TICKS_RCB | PMU_SKID_UNBOUNDED },
   // Performance cores from ARM from cortex-a76 on (including neoverse-n1 and later)
   // have the following counters that are reliable enough for us.
   // 0x21 == BR_RETIRED - Architecturally retired taken branches
@@ -185,9 +238,17 @@ static const PmuConfig pmu_configs[] = {
   // 0x11 == CPU_CYCLES - Cycle
   { ARMNeoverseN1, "ARM Neoverse N1", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
     "armv8_pmuv3_0", 0x11, -1, -1 },
+  { ARMNeoverseN2, "ARM Neoverse N2", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "armv8_pmuv3_0", 0x11, -1, -1 },
+  { ARMNeoverseN3, "ARM Neoverse N3", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "armv8_pmuv3_0", 0x11, -1, -1 },
   { ARMNeoverseV1, "ARM Neoverse V1", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
     "armv8_pmuv3_0", 0x11, -1, -1 },
-  { ARMNeoverseN2, "ARM Neoverse N2", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+  { ARMNeoverseV2, "ARM Neoverse V2", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "armv8_pmuv3_0", 0x11, -1, -1 },
+  { ARMNeoverseV3AE, "ARM Neoverse V3AE", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "armv8_pmuv3_0", 0x11, -1, -1 },
+  { ARMNeoverseV3, "ARM Neoverse V3", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
     "armv8_pmuv3_0", 0x11, -1, -1 },
   { ARMCortexA76, "ARM Cortex A76", 0x21, 0, 0x6F, 10000, PMU_TICKS_TAKEN_BRANCHES,
     "armv8_pmuv3", 0x11, -1, -1 },
@@ -210,10 +271,16 @@ static const PmuConfig pmu_configs[] = {
   { ARMNeoverseE1, "ARM Neoverse E1", 0, 0, 0, 0, 0 },
   { ARMCortexA55, "ARM Cortex A55", 0, 0, 0, 0, 0 },
   { ARMCortexA75, "ARM Cortex A75", 0, 0, 0, 0, 0 },
+  { AmpereOne, "AmpereOne", 0x21, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "armv8_pmuv3_0", 0x11, -1, -1 },
   { AppleM1Icestorm, "Apple M1 Icestorm", 0x90, 0, 0, 1000, PMU_TICKS_TAKEN_BRANCHES,
     "apple_icestorm_pmu", 0x8c, -1, -1 },
   { AppleM1Firestorm, "Apple M1 Firestorm", 0x90, 0, 0, 1000, PMU_TICKS_TAKEN_BRANCHES,
     "apple_firestorm_pmu", 0x8c, -1, -1 },
+  { AppleM2Blizzard, "Apple M2 Blizzard", 0x90, 0, 0, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "apple_blizzard_pmu", 0x8c, -1, -1 },
+  { AppleM2Avalanche, "Apple M2 Avalanche", 0x90, 0, 0, 1000, PMU_TICKS_TAKEN_BRANCHES,
+    "apple_avalanche_pmu", 0x8c, -1, -1 },
 };
 
 #define RR_SKID_MAX 10000
@@ -270,6 +337,7 @@ static int64_t read_counter(ScopedFd& fd) {
   return val;
 }
 
+// Can return a closed fd if `tid > 0` and the task was just SIGKILLed.
 static ScopedFd start_counter(pid_t tid, int group_fd,
                               struct perf_event_attr* attr,
                               bool* disabled_txcp = nullptr) {
@@ -278,7 +346,7 @@ static ScopedFd start_counter(pid_t tid, int group_fd,
   }
   attr->pinned = group_fd == -1;
   int fd = syscall(__NR_perf_event_open, attr, tid, -1, group_fd, PERF_FLAG_FD_CLOEXEC);
-  if (0 >= fd && errno == EINVAL && attr->type == PERF_TYPE_RAW &&
+  if (fd < 0 && errno == EINVAL && attr->type == PERF_TYPE_RAW &&
       (attr->config & IN_TXCP)) {
     // The kernel might not support IN_TXCP, so try again without it.
     struct perf_event_attr tmp_attr = *attr;
@@ -299,37 +367,75 @@ static ScopedFd start_counter(pid_t tid, int group_fd,
       }
     }
   }
-  if (0 >= fd) {
-    if (errno == EACCES) {
-      CLEAN_FATAL() << "Permission denied to use 'perf_event_open'; are hardware perf events "
-                 "available? See https://github.com/rr-debugger/rr/wiki/Will-rr-work-on-my-system";
+  if (fd < 0) {
+    switch (errno) {
+      case EACCES: {
+        // Debian/Ubuntu/Android? are known to carry a patch that creates
+        // additional perf_event_paranoid levels, and at level 4 no
+        // perf_event_open() is allowed at all.
+        // https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/noble/commit/kernel/events/core.c?id=e88769f04a4f050e02980f776942c28431e56faf
+        // XXXkhuey ideally we could suggest adding CAP_PERFMON to rr here
+        // but the patch only accepts CAP_SYS_ADMIN.
+        auto perf_event_paranoid = read_perf_event_paranoid();
+        if (perf_event_paranoid.has_value() && *perf_event_paranoid > 3) {
+          string paranoid_value = std::to_string(*perf_event_paranoid);
+          CLEAN_FATAL() <<
+            "rr needs /proc/sys/kernel/perf_event_paranoid <= 3, but it is "
+                        << paranoid_value << ".\n"
+                        << "Change it to <= 3.\n"
+                        << "Consider putting 'kernel.perf_event_paranoid = 3' in /etc/sysctl.d/10-rr.conf.\n"
+                        << "See 'man 8 sysctl', 'man 5 sysctl.d' (systemd systems)\n"
+                        << "and 'man 5 sysctl.conf' (non-systemd systems) for more details.";
+        }
+        RR_FALLTHROUGH;
+      }
+      case EPERM:
+        CLEAN_FATAL() << "Permission denied to use 'perf_event_open'; are hardware perf events "
+                   "available? See https://github.com/rr-debugger/rr/wiki/Will-rr-work-on-my-system";
+        break;
+      case ENOENT:
+        CLEAN_FATAL() << "Unable to open performance counter with 'perf_event_open'; "
+                   "are hardware perf events available? See https://github.com/rr-debugger/rr/wiki/Will-rr-work-on-my-system";
+        break;
+      case ESRCH:
+        if (tid > 0) {
+          break;
+        }
+        RR_FALLTHROUGH;
+      default:
+        FATAL() << "Failed to initialize counter";
+        break;
     }
-    if (errno == ENOENT) {
-      CLEAN_FATAL() << "Unable to open performance counter with 'perf_event_open'; "
-                 "are hardware perf events available? See https://github.com/rr-debugger/rr/wiki/Will-rr-work-on-my-system";
-    }
-    FATAL() << "Failed to initialize counter";
   }
   return ScopedFd(fd);
 }
 
-static void check_for_ioc_period_bug(perf_event_attrs &perf_attr) {
+// Returns the ticks minimum period.
+static uint32_t check_for_ioc_period_bug(perf_event_attrs &perf_attr) {
   // Start a cycles counter
   struct perf_event_attr attr = perf_attr.ticks;
   attr.sample_period = 0xffffffff;
   attr.exclude_kernel = 1;
   ScopedFd bug_fd = start_counter(0, -1, &attr);
 
-  uint64_t new_period = 1;
-  if (ioctl(bug_fd, PERF_EVENT_IOC_PERIOD, &new_period)) {
-    FATAL() << "ioctl(PERF_EVENT_IOC_PERIOD) failed";
+  uint64_t period = 1;
+  if (ioctl(bug_fd, PERF_EVENT_IOC_PERIOD, &period)) {
+    // On some hardware the kernel imposes a minimum period of 32 to work
+    // around errata, e.g.
+    // https://github.com/torvalds/linux/blob/11066801dd4b7c4d75fce65c812723a80c1481ae/arch/x86/events/intel/core.c#L4610
+    period = 32;
+    if (ioctl(bug_fd, PERF_EVENT_IOC_PERIOD, &period)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_PERIOD) failed";
+    }
   }
 
   struct pollfd poll_bug_fd = {.fd = bug_fd, .events = POLL_IN, .revents = 0 };
   poll(&poll_bug_fd, 1, 0);
 
   perf_attr.has_ioc_period_bug = poll_bug_fd.revents == 0;
-  LOG(debug) << "has_ioc_period_bug=" << perf_attr.has_ioc_period_bug;
+  LOG(debug) << "has_ioc_period_bug=" << perf_attr.has_ioc_period_bug
+    << " min_period=" << period;
+  return period;
 }
 
 static const int NUM_BRANCHES = 500;
@@ -401,12 +507,14 @@ static void check_working_counters(perf_event_attrs &perf_attr) {
   }
 }
 
-static void check_for_bugs(perf_event_attrs &perf_attr) {
+// Returns the ticks minimum period.
+static uint32_t check_for_bugs(perf_event_attrs &perf_attr) {
   DEBUG_ASSERT(!running_under_rr());
 
-  check_for_ioc_period_bug(perf_attr);
+  uint32_t min_period = check_for_ioc_period_bug(perf_attr);
   check_working_counters(perf_attr);
   check_for_arch_bugs(perf_attr);
+  return min_period;
 }
 
 static std::vector<CpuMicroarch> get_cpu_microarchs() {
@@ -549,7 +657,7 @@ static void check_pmu(int pmu_index) {
     return;
   }
 
-  check_for_bugs(perf_attr);
+  perf_attr.ticks_min_period = check_for_bugs(perf_attr);
   /*
    * For maintainability, and since it doesn't impact performance when not
    * needed, we always activate this. If it ever turns out to be a problem,
@@ -596,15 +704,23 @@ TicksSemantics PerfCounters::default_ticks_semantics() {
 uint32_t PerfCounters::skid_size() {
   DEBUG_ASSERT(attributes_initialized);
   DEBUG_ASSERT(perf_attrs[pmu_index].checked);
-  return perf_attrs[pmu_index].skid_size;
+  // If we want to stop after one event, and our minimum period is Y,
+  // and the skid size is X, then we'll actually use a period of Y
+  // and potentially skid to Y + X, so report Y + X as the skid size.
+  return perf_attrs[pmu_index].skid_size +
+      perf_attrs[pmu_index].ticks_min_period;
 }
 
 PerfCounters::PerfCounters(pid_t tid, int cpu_binding,
-                           TicksSemantics ticks_semantics, bool enable)
+                           TicksSemantics ticks_semantics, Enabled enabled,
+                           IntelPTEnabled enable_pt)
     : tid(tid), pmu_index(get_pmu_index(cpu_binding)), ticks_semantics_(ticks_semantics),
-      enable(enable), started(false), counting(false) {
+      enabled(enabled), opened(false), counting(false) {
   if (!supports_ticks_semantics(ticks_semantics)) {
     FATAL() << "Ticks semantics " << ticks_semantics << " not supported";
+  }
+  if (enable_pt == PT_ENABLE) {
+    pt_state = make_unique<PTState>();
   }
 }
 
@@ -615,21 +731,196 @@ static void make_counter_async(ScopedFd& fd, int signal) {
   }
 }
 
-void PerfCounters::reset(Ticks ticks_period) {
-  if (!enable) {
+static void infallible_perf_event_reset_if_open(ScopedFd& fd) {
+  if (fd.is_open()) {
+    if (ioctl(fd, PERF_EVENT_IOC_RESET, 0)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
+    }
+  }
+}
+
+static void infallible_perf_event_enable_if_open(ScopedFd& fd) {
+  if (fd.is_open()) {
+    if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+    }
+  }
+}
+
+static void infallible_perf_event_disable_if_open(ScopedFd& fd) {
+  if (fd.is_open()) {
+    if (ioctl(fd, PERF_EVENT_IOC_DISABLE, 0)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+    }
+  }
+}
+
+static uint32_t pt_event_type() {
+  static const char file_name[] = "/sys/bus/event_source/devices/intel_pt/type";
+  ScopedFd fd(file_name, O_RDONLY);
+  if (!fd.is_open()) {
+    FATAL() << "Can't open " << file_name << ", PT events not available";
+  }
+  char buf[6];
+  ssize_t ret = read(fd, buf, sizeof(buf));
+  if (ret < 1 || ret > 5) {
+    FATAL() << "Invalid value in " << file_name;
+  }
+  char* end_ptr;
+  unsigned long value = strtoul(buf, &end_ptr, 10);
+  if (end_ptr < buf + ret && *end_ptr && *end_ptr != '\n') {
+    FATAL() << "Invalid value in " << file_name;
+  }
+  return value;
+}
+
+static const size_t PT_PERF_DATA_SIZE = 8*1024*1024;
+static const size_t PT_PERF_AUX_SIZE = 128*1024*1024;
+
+struct PTCopyThreadState {
+  pthread_mutex_t mutex;
+  unordered_set<PerfCounters::PTState*> counting_pt_states;
+
+  PTCopyThreadState() {
+    pthread_mutex_init(&mutex, nullptr);
+    pthread_t thread;
+    pthread_create(&thread, nullptr, do_thread, this);
+    pthread_setname_np(thread, "pt_copy");
+  }
+  void start_copying(PerfCounters::PTState* state) {
+    pthread_mutex_lock(&mutex);
+    counting_pt_states.insert(state);
+    pthread_mutex_unlock(&mutex);
+  }
+  void stop_copying(PerfCounters::PTState* state) {
+    pthread_mutex_lock(&mutex);
+    counting_pt_states.erase(state);
+    pthread_mutex_unlock(&mutex);
+  }
+
+private:
+  static void* do_thread(void* p) {
+    static_cast<PTCopyThreadState*>(p)->thread_run();
+    return nullptr;
+  }
+  void thread_run() {
+    while (true) {
+      pthread_mutex_lock(&mutex);
+      while (true) {
+        bool did_work = false;
+        for (PerfCounters::PTState* state : counting_pt_states) {
+          size_t bytes = state->flush();
+          if (bytes > 0) {
+            did_work = true;
+          }
+        }
+        if (!did_work) {
+          break;
+        }
+      }
+      pthread_mutex_unlock(&mutex);
+
+      struct timespec ts = { 0, 250000 };
+      nanosleep(&ts, nullptr);
+    }
+  }
+};
+
+static PTCopyThreadState* pt_thread_state;
+
+void PerfCounters::start_pt_copy_thread() {
+  if (!pt_thread_state) {
+    pt_thread_state = new PTCopyThreadState();
+  }
+}
+
+// See https://github.com/intel/libipt/blob/master/doc/howto_capture.md
+void PerfCounters::PTState::open(pid_t tid) {
+  static uint32_t event_type = pt_event_type();
+
+  struct perf_event_attr attr;
+  init_perf_event_attr(&attr, event_type, 0);
+  attr.aux_watermark = 8 * 1024 * 1024;
+  pt_perf_event_fd = start_counter(tid, -1, &attr);
+  if (!pt_perf_event_fd.is_open()) {
     return;
   }
-  DEBUG_ASSERT(ticks_period >= 0);
+
+  perf_buffers.allocate(pt_perf_event_fd, PT_PERF_DATA_SIZE, PT_PERF_AUX_SIZE);
+}
+
+size_t PerfCounters::PTState::flush() {
+  if (!perf_buffers.allocated()) {
+    return 0;
+  }
+
+  size_t ret = 0;
+
+  while (auto packet = perf_buffers.next_packet()) {
+    struct perf_event_header header = *packet->data();
+    switch (header.type) {
+      case PERF_RECORD_LOST:
+        FATAL() << "PT records lost!";
+        break;
+      case PERF_RECORD_ITRACE_START:
+        break;
+      case PERF_RECORD_AUX: {
+        auto aux_packet = *reinterpret_cast<PerfEventAux*>(packet->data());
+        if (aux_packet.flags) {
+          if (aux_packet.flags & PERF_AUX_FLAG_TRUNCATED) {
+            CLEAN_FATAL() << "PT aux data truncated. Try increasing "
+              "PT_PERF_AUX_SIZE in src/PerfCounters.cc and rerecording.";
+          }
+          FATAL() << "Unexpected AUX packet flags " << aux_packet.flags;
+        }
+        pt_data.data.emplace_back();
+        vector<uint8_t>& data = pt_data.data.back();
+        data.resize(aux_packet.aux_size);
+        memcpy(data.data(), packet->aux_data(), aux_packet.aux_size);
+        ret += aux_packet.aux_size;
+        break;
+      }
+      default:
+        FATAL() << "Unknown record " << header.type;
+        break;
+    }
+  }
+
+  return ret;
+}
+
+PTData PerfCounters::extract_intel_pt_data() {
+  PTData result;
+  if (pt_state) {
+    result = std::move(pt_state->pt_data);
+  }
+  return result;
+}
+
+void PerfCounters::PTState::close() {
+  pt_perf_event_fd.close();
+  perf_buffers.destroy();
+}
+
+void PerfCounters::start(Task* t, Ticks ticks_period) {
+  ASSERT(t, !counting);
+  ASSERT(t, ticks_period >= 0);
+
+  if (enabled == DISABLE) {
+    return;
+  }
+
   check_pmu(pmu_index);
 
   auto &perf_attr = perf_attrs[pmu_index];
-  if (ticks_period == 0 && !always_recreate_counters(perf_attr)) {
+  if (ticks_period == 0) {
     // We can't switch a counter between sampling and non-sampling via
     // PERF_EVENT_IOC_PERIOD so just turn 0 into a very big number.
     ticks_period = uint64_t(1) << 60;
   }
+  ticks_period = max<Ticks>(ticks_period, perf_attr.ticks_min_period);
 
-  if (!started) {
+  if (!opened) {
     LOG(debug) << "Recreating counters with period " << ticks_period;
 
     struct perf_event_attr attr = perf_attr.ticks;
@@ -650,94 +941,103 @@ void PerfCounters::reset(Ticks ticks_period) {
       fd_useless_counter = start_counter(tid, -1, &perf_attr.cycles);
     }
 
-    struct f_owner_ex own;
-    own.type = F_OWNER_TID;
-    own.pid = tid;
-    if (fcntl(fd_ticks_interrupt, F_SETOWN_EX, &own)) {
-      FATAL() << "Failed to SETOWN_EX ticks event fd";
+    if (fd_ticks_interrupt.is_open()) {
+      struct f_owner_ex own;
+      own.type = F_OWNER_TID;
+      own.pid = tid;
+      if (fcntl(fd_ticks_interrupt, F_SETOWN_EX, &own)) {
+        FATAL() << "Failed to SETOWN_EX ticks event fd";
+      }
+      make_counter_async(fd_ticks_interrupt, PerfCounters::TIME_SLICE_SIGNAL);
     }
-    make_counter_async(fd_ticks_interrupt, PerfCounters::TIME_SLICE_SIGNAL);
+
+    if (pt_state) {
+      pt_state->open(tid);
+      pt_thread_state->start_copying(pt_state.get());
+    }
   } else {
     LOG(debug) << "Resetting counters with period " << ticks_period;
 
-    if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_RESET, 0)) {
-      FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
-    }
+    infallible_perf_event_reset_if_open(fd_ticks_interrupt);
     if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_PERIOD, &ticks_period)) {
       FATAL() << "ioctl(PERF_EVENT_IOC_PERIOD) failed with period "
               << ticks_period;
     }
-    if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_ENABLE, 0)) {
-      FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
-    }
-    if (fd_minus_ticks_measure.is_open()) {
-      if (ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_RESET, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
-      }
-      if (ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_ENABLE, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
-      }
-    }
-    if (fd_ticks_measure.is_open()) {
-      if (ioctl(fd_ticks_measure, PERF_EVENT_IOC_RESET, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
-      }
-      if (ioctl(fd_ticks_measure, PERF_EVENT_IOC_ENABLE, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
-      }
-    }
-    if (fd_ticks_in_transaction.is_open()) {
-      if (ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_RESET, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
-      }
-      if (ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_ENABLE, 0)) {
-        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
-      }
+    infallible_perf_event_enable_if_open(fd_ticks_interrupt);
+
+    infallible_perf_event_reset_if_open(fd_minus_ticks_measure);
+    infallible_perf_event_enable_if_open(fd_minus_ticks_measure);
+
+    infallible_perf_event_reset_if_open(fd_ticks_measure);
+    infallible_perf_event_enable_if_open(fd_ticks_measure);
+
+    infallible_perf_event_reset_if_open(fd_ticks_in_transaction);
+    infallible_perf_event_enable_if_open(fd_ticks_in_transaction);
+
+    if (pt_state) {
+      infallible_perf_event_enable_if_open(pt_state->pt_perf_event_fd);
+      pt_thread_state->start_copying(pt_state.get());
     }
   }
 
-  started = true;
+  opened = true;
   counting = true;
   counting_period = ticks_period;
 }
 
 void PerfCounters::set_tid(pid_t tid) {
-  stop();
+  close();
   this->tid = tid;
 }
 
-void PerfCounters::stop() {
-  if (!started) {
+void PerfCounters::close() {
+  if (counting) {
+    FATAL() << "Can't close while counting task " << tid;
+  }
+
+  if (!opened) {
     return;
   }
-  started = false;
+  opened = false;
+  if (pt_state) {
+    pt_state->close();
+  }
 
   fd_ticks_interrupt.close();
   fd_ticks_measure.close();
   fd_minus_ticks_measure.close();
   fd_useless_counter.close();
   fd_ticks_in_transaction.close();
+  fd_async_signal_accelerator.close();
 }
 
-void PerfCounters::stop_counting() {
+Ticks PerfCounters::stop(Task* t, Error* error) {
   if (!counting) {
-    return;
+    if (error) {
+      *error = Error::None;
+    }
+    return 0;
   }
+
+  Ticks ticks = read_ticks(t, error);
   counting = false;
-  if (always_recreate_counters(perf_attrs[pmu_index])) {
-    stop();
-  } else {
-    ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_DISABLE, 0);
-    if (fd_minus_ticks_measure.is_open()) {
-      ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_DISABLE, 0);
-    }
-    if (fd_ticks_measure.is_open()) {
-      ioctl(fd_ticks_measure, PERF_EVENT_IOC_DISABLE, 0);
-    }
-    if (fd_ticks_in_transaction.is_open()) {
-      ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_DISABLE, 0);
-    }
+  if (pt_state) {
+    pt_thread_state->stop_copying(pt_state.get());
+    pt_state->flush();
   }
+  if (always_recreate_counters(perf_attrs[pmu_index])) {
+    close();
+  } else {
+    infallible_perf_event_disable_if_open(fd_ticks_interrupt);
+    infallible_perf_event_disable_if_open(fd_minus_ticks_measure);
+    infallible_perf_event_disable_if_open(fd_ticks_measure);
+    infallible_perf_event_disable_if_open(fd_ticks_in_transaction);
+    if (pt_state) {
+      infallible_perf_event_disable_if_open(pt_state->pt_perf_event_fd);
+    }
+    infallible_perf_event_disable_if_open(fd_async_signal_accelerator);
+  }
+  return ticks;
 }
 
 // Note that on aarch64 this is also used to get the count for `ret`
@@ -756,10 +1056,14 @@ Ticks PerfCounters::ticks_for_direct_call(Task*) {
   return (pmu_semantics_flags & PMU_TICKS_TAKEN_BRANCHES) ? 1 : 0;
 }
 
-Ticks PerfCounters::read_ticks(Task* t) {
-  if (!started || !counting) {
-    return 0;
+Ticks PerfCounters::read_ticks(Task* t, Error* error) {
+  if (error) {
+    *error = Error::None;
   }
+
+  ASSERT(t, opened);
+  ASSERT(t, counting);
+  ASSERT(t, counting_period > 0);
 
   if (fd_ticks_in_transaction.is_open()) {
     uint64_t transaction_ticks = read_counter(fd_ticks_in_transaction);
@@ -782,7 +1086,7 @@ Ticks PerfCounters::read_ticks(Task* t) {
     if (strex_count > 0) {
       LOG(debug) << strex_count << " strex detected";
       if (!Flags::get().force_things) {
-        CLEAN_FATAL()
+        ASSERT(t, false)
             << strex_count
             << " (speculatively) executed strex instructions detected. \n"
                "On aarch64, rr only supports applications making use of LSE\n"
@@ -796,14 +1100,18 @@ Ticks PerfCounters::read_ticks(Task* t) {
   uint64_t adjusted_counting_period =
       counting_period +
       (t->session().is_recording() ? recording_skid_size() : skid_size());
-  uint64_t interrupt_val = read_counter(fd_ticks_interrupt);
+  uint64_t interrupt_val = 0;
+  if (fd_ticks_interrupt.is_open()) {
+    interrupt_val = read_counter(fd_ticks_interrupt);
+  }
+  uint64_t ret;
   if (!fd_ticks_measure.is_open()) {
     if (fd_minus_ticks_measure.is_open()) {
       uint64_t minus_measure_val = read_counter(fd_minus_ticks_measure);
       interrupt_val -= minus_measure_val;
     }
     if (t->session().is_recording()) {
-      if (counting_period && interrupt_val > adjusted_counting_period) {
+      if (interrupt_val > adjusted_counting_period) {
         LOG(warn) << "Recorded ticks of " << interrupt_val
           << " overshot requested ticks target by " << interrupt_val - counting_period
           << " ticks.\n"
@@ -812,33 +1120,212 @@ Ticks PerfCounters::read_ticks(Task* t) {
            "received after this warning, any conditions that reliably reproduce it,\n"
            "or sightings of this warning on non-AMD systems.";
       }
-    } else {
-      ASSERT(t, !counting_period || interrupt_val <= adjusted_counting_period)
-          << "Detected " << interrupt_val << " ticks, expected no more than "
-          << adjusted_counting_period;
     }
-    return interrupt_val;
+    ret = interrupt_val;
+  } else {
+    uint64_t measure_val = read_counter(fd_ticks_measure);
+    if (measure_val > interrupt_val) {
+      // There is some kind of kernel or hardware bug that means we sometimes
+      // see more events with IN_TXCP set than without. These are clearly
+      // spurious events :-(. For now, work around it by returning the
+      // interrupt_val. That will work if HLE hasn't been used in this interval.
+      // Note that interrupt_val > measure_val is valid behavior (when HLE is
+      // being used).
+      LOG(debug) << "Measured too many ticks; measure=" << measure_val
+                 << ", interrupt=" << interrupt_val;
+      ret = interrupt_val;
+    } else {
+      ret = measure_val;
+    }
+  }
+  if (!t->session().is_recording() && ret > adjusted_counting_period) {
+    if (error && (perf_attrs[pmu_index].pmu_flags & PMU_SKID_UNBOUNDED)) {
+      *error = Error::Transient;
+    } else {
+      ASSERT(t, false) << "Detected " << ret
+          << " ticks, expected no more than " << adjusted_counting_period;
+    }
+  }
+  return ret;
+}
+
+#ifdef BPF
+class BpfAccelerator {
+public:
+  static std::shared_ptr<BpfAccelerator> get_or_create();
+
+  ScopedFd create_counter(pid_t tid);
+  void match_regs_and_open_counter(const Registers& regs, ScopedFd& counter);
+  uint64_t skips() const {
+    return *bpf_skips;
   }
 
-  uint64_t measure_val = read_counter(fd_ticks_measure);
-  if (measure_val > interrupt_val) {
-    // There is some kind of kernel or hardware bug that means we sometimes
-    // see more events with IN_TXCP set than without. These are clearly
-    // spurious events :-(. For now, work around it by returning the
-    // interrupt_val. That will work if HLE hasn't been used in this interval.
-    // Note that interrupt_val > measure_val is valid behavior (when HLE is
-    // being used).
-    LOG(debug) << "Measured too many ticks; measure=" << measure_val
-               << ", interrupt=" << interrupt_val;
-    ASSERT(t, !counting_period || interrupt_val <= adjusted_counting_period)
-        << "Detected " << interrupt_val << " ticks, expected no more than "
-        << adjusted_counting_period;
-    return interrupt_val;
+  // Can't be private because of make_shared.
+  BpfAccelerator(struct bpf_object* bpf_obj, int bpf_prog_fd,
+                 user_regs_struct* bpf_regs, uint64_t* bpf_skips)
+    : bpf_obj(bpf_obj), bpf_prog_fd(bpf_prog_fd), bpf_regs(bpf_regs), bpf_skips(bpf_skips)
+  {}
+
+  ~BpfAccelerator() {
+    munmap(bpf_skips, 4096);
+    munmap(bpf_regs, 4096);
+    bpf_object__close(bpf_obj);
   }
-  ASSERT(t, !counting_period || measure_val <= adjusted_counting_period)
-      << "Detected " << measure_val << " ticks, expected no more than "
-      << adjusted_counting_period;
-  return measure_val;
+
+private:
+  static std::shared_ptr<BpfAccelerator> singleton;
+
+  struct perf_event_attr attr;
+  struct bpf_object* bpf_obj;
+  // Not a ScopedFd because the bpf_object maintains ownership.
+  int bpf_prog_fd;
+  user_regs_struct* bpf_regs;
+  uint64_t* bpf_skips;
+};
+
+std::shared_ptr<BpfAccelerator> BpfAccelerator::singleton;
+
+/* static */ std::shared_ptr<BpfAccelerator> BpfAccelerator::get_or_create() {
+  static int initialized;
+  if (BpfAccelerator::singleton) {
+    return BpfAccelerator::singleton;
+  }
+
+  if (!initialized) {
+    initialized = -1;
+
+    libbpf_set_strict_mode(LIBBPF_STRICT_DIRECT_ERRS);
+    string path = resource_path() + "share/rr/async_event_filter.o";
+    struct bpf_object* obj = bpf_object__open(path.c_str());
+    if ((intptr_t)obj <= 0) {
+      LOG(error) << "Failed to find bpf at " << path;
+      return nullptr;
+    }
+    if (bpf_object__load(obj) < 0) {
+      LOG(error) << "Failed to load bpf at " << path << " into the kernel. Do we have permissions?";
+      bpf_object__close(obj);
+      return nullptr;
+    }
+    int bpf_map_fd = bpf_object__find_map_fd_by_name(obj, "registers");
+    if (bpf_map_fd < 0) {
+      CLEAN_FATAL() << "rr's bpf at " << path << " is corrupt";
+      return nullptr;
+    }
+    struct bpf_program* prog = bpf_object__next_program(obj, nullptr);
+    if (!prog) {
+      CLEAN_FATAL() << "rr's bpf at " << path << " is corrupt";
+      return nullptr;
+    }
+    int bpf_prog_fd = bpf_program__fd(prog);
+    if (bpf_prog_fd < 0) {
+      CLEAN_FATAL() << "rr's bpf at " << path << " is corrupt";
+      return nullptr;
+    }
+
+    auto bpf_regs = (struct user_regs_struct*)
+      mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+           MAP_SHARED, bpf_map_fd, 0);
+    if (bpf_regs == MAP_FAILED) {
+      CLEAN_FATAL() << "Failed to mmap bpf maps";
+      return nullptr;
+    }
+
+    bpf_map_fd = bpf_object__find_map_fd_by_name(obj, "skips");
+    if (bpf_map_fd < 0) {
+      CLEAN_FATAL() << "rr's bpf at " << path << " is corrupt";
+      return nullptr;
+    }
+
+    auto bpf_skips = (uint64_t*)
+      mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+           MAP_SHARED, bpf_map_fd, 0);
+    if (bpf_regs == MAP_FAILED) {
+      CLEAN_FATAL() << "Failed to mmap bpf maps";
+      return nullptr;
+    }
+
+    BpfAccelerator::singleton =
+      std::make_shared<BpfAccelerator>(obj, bpf_prog_fd, bpf_regs, bpf_skips);
+    memset(&singleton->attr, 0, sizeof(singleton->attr));
+    singleton->attr.type = PERF_TYPE_BREAKPOINT;
+    singleton->attr.size = sizeof(attr);
+    singleton->attr.bp_type = HW_BREAKPOINT_X;
+    singleton->attr.bp_len = sizeof(long);
+    singleton->attr.sample_period = 1;
+    singleton->attr.sample_type = PERF_SAMPLE_IP;
+    singleton->attr.pinned = 1;
+    singleton->attr.exclude_kernel = 1;
+    singleton->attr.exclude_hv = 1;
+    singleton->attr.wakeup_events = 1;
+    singleton->attr.precise_ip = 3;
+    singleton->attr.disabled = 1;
+    initialized = 1;
+  }
+
+  return BpfAccelerator::singleton;
 }
+
+ScopedFd BpfAccelerator::create_counter(pid_t tid) {
+  attr.bp_addr = 0;
+  ScopedFd fd = start_counter(tid, -1, &attr);
+
+  struct f_owner_ex own;
+  own.type = F_OWNER_TID;
+  own.pid = tid;
+  if (fcntl(fd, F_SETOWN_EX, &own)) {
+    FATAL() << "Failed to SETOWN_EX bpf-accelerated breakpoint fd";
+  }
+
+  make_counter_async(fd, SIGTRAP);
+
+  if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, bpf_prog_fd)) {
+    FATAL() << "Failed PERF_EVENT_IOC_SET_BPF";
+  }
+
+  return fd;
+}
+
+void BpfAccelerator::match_regs_and_open_counter(const Registers& regs, ScopedFd& fd) {
+  attr.bp_addr = regs.ip().register_value();
+  if (ioctl(fd, PERF_EVENT_IOC_MODIFY_ATTRIBUTES, &attr)) {
+    FATAL() << "Failed PERF_EVENT_IOC_MODIFY_ATTRIBUTES";
+  }
+
+  auto r = regs.get_ptrace();
+  memcpy(bpf_regs, &r, sizeof(struct user_regs_struct));
+  *bpf_skips = 0;
+
+  infallible_perf_event_enable_if_open(fd);
+}
+
+bool PerfCounters::accelerate_async_signal(const Registers& regs) {
+  if (!fd_async_signal_accelerator.is_open()) {
+    if (!bpf) {
+      bpf = BpfAccelerator::get_or_create();
+    }
+
+    if (!bpf) {
+      return false;
+    }
+
+    fd_async_signal_accelerator = bpf->create_counter(tid);
+  }
+
+  if (!fd_async_signal_accelerator.is_open()) {
+    return false;
+  }
+
+  bpf->match_regs_and_open_counter(regs, fd_async_signal_accelerator);
+  return true;
+}
+
+uint64_t PerfCounters::bpf_skips() const {
+  if (!bpf) {
+    return 0;
+  }
+
+  return bpf->skips();
+}
+#endif
 
 } // namespace rr

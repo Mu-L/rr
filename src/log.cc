@@ -13,13 +13,17 @@
 
 #include "DumpCommand.h"
 #include "Flags.h"
-#include "GdbConnection.h"
+#include "GdbServerConnection.h"
 #include "GdbServer.h"
 #include "RecordSession.h"
+#include "ReplaySession.h"
+#include "ReplayTask.h"
 #include "core.h"
 #include "ftrace.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
+#include "launch_debugger.h"
+#include "processor_trace_check.h"
 #include "util.h"
 
 using namespace std;
@@ -28,6 +32,7 @@ ostream& operator<<(ostream& stream, const siginfo_t& siginfo) {
   stream << "{signo:" << rr::signal_name(siginfo.si_signo)
          << ",errno:" << rr::errno_name(siginfo.si_errno)
          << ",code:" << rr::sicode_name(siginfo.si_code, siginfo.si_signo);
+  bool show_pid = false;
   switch (siginfo.si_signo) {
     case SIGILL:
     case SIGFPE:
@@ -36,6 +41,23 @@ ostream& operator<<(ostream& stream, const siginfo_t& siginfo) {
     case SIGTRAP:
       stream << ",addr:" << siginfo.si_addr;
       break;
+    case SIGCHLD:
+      show_pid = true;
+      break;
+    default:
+      break;
+  }
+  switch (siginfo.si_code) {
+    case SI_USER:
+    case SI_QUEUE:
+    case SI_TKILL:
+      show_pid = true;
+      break;
+    default:
+      break;
+  }
+  if (show_pid) {
+    stream << ",pid:" << siginfo.si_pid;
   }
   stream << "}";
   return stream;
@@ -380,12 +402,38 @@ NewlineTerminatingOstream::NewlineTerminatingOstream(LogModule** m_ptr,
   }
 }
 
+// We try not to allocate in here.
+static void dump_stack_and_abort() {
+  int pipes[2];
+  int ret = pipe(pipes);
+  if (ret >= 0) {
+    // Default pipe size is 64K which should be enough
+    {
+      ScopedFd write_fd(pipes[1]);
+      dump_rr_stack(write_fd);
+    }
+    ScopedFd read_fd(pipes[0]);
+    while (true) {
+      char buf[1024];
+      ret = read(read_fd, buf, sizeof(buf) - 1);
+      if (ret <= 0) {
+        break;
+      }
+      log_stream().write(buf, ret);
+    }
+  }
+  flush_log_stream();
+  flush_log_file();
+  notifying_abort();
+}
+
 NewlineTerminatingOstream::~NewlineTerminatingOstream() {
   if (enabled) {
     log_stream() << endl;
-    flush_log_stream();
     if (Flags::get().fatal_errors_and_warnings && level <= LOG_warn) {
-      notifying_abort();
+      dump_stack_and_abort();
+    } else {
+      flush_log_stream();
     }
   }
 }
@@ -409,8 +457,7 @@ FatalOstream::FatalOstream(const char* file, int line, const char* function) {
 
 FatalOstream::~FatalOstream() {
   log_stream() << endl;
-  flush_log_stream();
-  notifying_abort();
+  dump_stack_and_abort();
 }
 
 static const int LAST_EVENT_COUNT = 20;
@@ -430,7 +477,7 @@ static void dump_last_events(const TraceStream& trace) {
   dump(trace.dir(), flags, specs, stderr);
 }
 
-static void emergency_debug(Task* t) {
+static void start_emergency_debug(Task* t) {
   ftrace::stop();
 
   // Enable SIGINT in case it was disabled. Users want to be able to ctrl-C
@@ -443,6 +490,9 @@ static void emergency_debug(Task* t) {
   RecordSession* record_session = t->session().as_record();
   if (record_session) {
     record_session->close_trace_writer(TraceWriter::CLOSE_ERROR);
+  }
+  if (t->session().is_replaying()) {
+    emergency_check_intel_pt(static_cast<ReplayTask*>(t), log_stream());
   }
 
   // Capture the log buffer now to prevent the log messages from the trace
@@ -459,13 +509,15 @@ static void emergency_debug(Task* t) {
 
   if (probably_not_interactive() && !Flags::get().force_things &&
       !getenv("RUNNING_UNDER_TEST_MONITOR")) {
-    errno = 0;
-    FATAL()
+    CLEAN_FATAL()
         << "(session doesn't look interactive, aborting emergency debugging)";
   }
+  if (!t->thread_group()) {
+    CLEAN_FATAL() << "(task is in a bad state, aborting emergency debugging)";
+  }
 
-  GdbServer::emergency_debug(t);
-  FATAL() << "Can't resume execution from invalid state";
+  emergency_debug(t);
+  CLEAN_FATAL() << "Can't resume execution from invalid state";
 }
 
 EmergencyDebugOstream::EmergencyDebugOstream(bool cond, const Task* t,
@@ -486,7 +538,7 @@ EmergencyDebugOstream::~EmergencyDebugOstream() {
     log_stream() << endl;
     flush_log_stream();
     t->log_pending_events();
-    emergency_debug(t);
+    start_emergency_debug(t);
   }
 }
 

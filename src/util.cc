@@ -15,6 +15,7 @@
 #include <linux/magic.h>
 #include <linux/prctl.h>
 #include <math.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -42,6 +44,7 @@
 #include "ReplaySession.h"
 #include "RecordTask.h"
 #include "ReplayTask.h"
+#include "ScopedFd.h"
 #include "TraceStream.h"
 #include "WaitManager.h"
 #include "core.h"
@@ -271,10 +274,11 @@ void dump_binary_data(const char* filename, const char* label,
   fclose(out);
 }
 
-void format_dump_filename(Task* t, FrameTime global_time, const char* tag,
-                          char* filename, size_t filename_size) {
-  snprintf(filename, filename_size - 1, "%s/%d_%lld_%s", t->trace_dir().c_str(),
-           t->rec_tid, (long long)global_time, tag);
+string format_dump_filename(Task* t, FrameTime global_time, const char* tag) {
+  stringstream s;
+  s << t->trace_dir() << "/" << global_time << "_" << t->rec_tid << "_"
+    << tag;
+  return s.str();
 }
 
 bool should_dump_memory(const Event& event, FrameTime time) {
@@ -291,11 +295,8 @@ bool should_dump_memory(const Event& event, FrameTime time) {
 }
 
 void dump_process_memory(Task* t, FrameTime global_time, const char* tag) {
-  char filename[PATH_MAX];
-  FILE* dump_file;
-
-  format_dump_filename(t, global_time, tag, filename, sizeof(filename));
-  dump_file = fopen64(filename, "w");
+  string filename = format_dump_filename(t, global_time, tag);
+  FILE* dump_file = fopen64(filename.c_str(), "w");
 
   const AddressSpace& as = *(t->vm());
   for (const auto& m : as.maps()) {
@@ -315,12 +316,42 @@ void dump_process_memory(Task* t, FrameTime global_time, const char* tag) {
   fclose(dump_file);
 }
 
+void write_pt_data(Task* t, FrameTime global_time, const vector<vector<uint8_t>>& data) {
+  string filename = format_dump_filename(t, global_time, "pt");
+  ScopedFd dump_file(filename.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0700);
+  ASSERT(t, dump_file.is_open()) << "Can't write to file " << filename;
+  for (const auto& d : data) {
+    write_all(dump_file, d.data(), d.size());
+  }
+}
+
+vector<uint8_t> read_pt_data(Task* t, FrameTime global_time) {
+  string filename = format_dump_filename(t, global_time, "pt");
+  FILE* dump_file = fopen64(filename.c_str(), "r");
+  vector<uint8_t> result;
+  if (!dump_file) {
+    return result;
+  }
+
+  while (true) {
+    char buf[1024*1024];
+    size_t bytes_read = fread(buf, 1, sizeof(buf), dump_file);
+    if (bytes_read) {
+      size_t current_size = result.size();
+      result.resize(current_size + bytes_read);
+      memcpy(result.data() + current_size, buf, bytes_read);
+    }
+    if (bytes_read < sizeof(buf)) {
+      break;
+    }
+  }
+  fclose(dump_file);
+  return result;
+}
+
 static void notify_checksum_error(ReplayTask* t, FrameTime global_time,
                                   unsigned checksum, unsigned rec_checksum,
                                   const string& raw_map_line) {
-  char cur_dump[PATH_MAX];
-  char rec_dump[PATH_MAX];
-
   dump_process_memory(t, global_time, "checksum_error");
 
   /* TODO: if the right recorder memory dump is present,
@@ -328,9 +359,8 @@ static void notify_checksum_error(ReplayTask* t, FrameTime global_time,
    * not-mapped-during-replay region(s) into account.  And if
    * not present, tell the user how to make one in a future
    * run. */
-  format_dump_filename(t, global_time, "checksum_error", cur_dump,
-                       sizeof(cur_dump));
-  format_dump_filename(t, global_time, "rec", rec_dump, sizeof(rec_dump));
+  string cur_dump = format_dump_filename(t, global_time, "checksum_error");
+  string rec_dump = format_dump_filename(t, global_time, "rec");
 
   const Event& ev = t->current_trace_frame().event();
   ASSERT(t, checksum == rec_checksum)
@@ -352,18 +382,6 @@ static void notify_checksum_error(ReplayTask* t, FrameTime global_time,
          "\n"
       << "$ diff -u " << rec_dump << " " << cur_dump << " > mem-diverge.diff\n";
 }
-
-/**
- * This helper does the heavy lifting of storing or validating
- * checksums.  The iterator data determines which behavior the helper
- * function takes on, and to/from which file it writes/read.
- */
-enum ChecksumMode { STORE_CHECKSUMS, VALIDATE_CHECKSUMS };
-struct checksum_iterator_data {
-  ChecksumMode mode;
-  FILE* checksums_file;
-  FrameTime global_time;
-};
 
 static bool checksum_segment_filter(const AddressSpace::Mapping& m) {
   struct stat st;
@@ -405,184 +423,6 @@ static uint32_t compute_checksum(void* data, size_t len) {
 static const uint32_t ignored_checksum = 0x98765432;
 static const uint32_t sigbus_checksum = 0x23456789;
 
-static bool is_task_buffer(const AddressSpace& as,
-                           const AddressSpace::Mapping& m) {
-  for (Task* t : as.task_set()) {
-    if (t->syscallbuf_child.cast<void>() == m.map.start() &&
-        t->syscallbuf_size == m.map.size()) {
-      return true;
-    }
-    if (t->scratch_ptr == m.map.start() &&
-        t->scratch_size == (ssize_t)m.map.size()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-struct ParsedChecksumLine {
-  remote_ptr<void> start;
-  remote_ptr<void> end;
-  unsigned int checksum;
-};
-
-/**
- * Either create and store checksums for each segment mapped in |t|'s
- * address space, or validate an existing computed checksum.  Behavior
- * is selected by |mode|.
- */
-static void iterate_checksums(Task* t, ChecksumMode mode,
-                              FrameTime global_time) {
-  struct checksum_iterator_data c;
-  memset(&c, 0, sizeof(c));
-  char filename[PATH_MAX];
-  const char* fmode = (STORE_CHECKSUMS == mode) ? "w" : "r";
-
-  c.mode = mode;
-  snprintf(filename, sizeof(filename) - 1, "%s/%lld_%d", t->trace_dir().c_str(),
-           (long long)global_time, t->rec_tid);
-  c.checksums_file = fopen64(filename, fmode);
-  c.global_time = global_time;
-  if (!c.checksums_file) {
-    FATAL() << "Failed to open checksum file " << filename;
-  }
-
-  ReplaySession *replay = t->session().as_replay();
-  remote_ptr<unsigned char> in_replay_flag;
-  if (replay && replay->has_trace_quirk(TraceReader::UsesGlobalsInReplay) && t->preload_globals) {
-    in_replay_flag = REMOTE_PTR_FIELD(t->preload_globals, reserved_legacy_in_replay);
-    t->write_mem(in_replay_flag, (unsigned char)0);
-  }
-
-  AddressSpace& as = *t->vm();
-  vector<ParsedChecksumLine> checksums;
-  if (VALIDATE_CHECKSUMS == mode) {
-    while (true) {
-      char line[1024];
-      if (!fgets(line, sizeof(line), c.checksums_file)) {
-        break;
-      }
-      ParsedChecksumLine parsed;
-      unsigned long rec_start;
-      unsigned long rec_end;
-      int nparsed =
-          sscanf(line, "(%x) %lx-%lx", &parsed.checksum, &rec_start, &rec_end);
-      parsed.start = rec_start;
-      parsed.end = rec_end;
-      ASSERT(t, 3 == nparsed) << "Parsed " << nparsed << " items";
-      checksums.push_back(parsed);
-
-      as.ensure_replay_matches_single_recorded_mapping(t, MemoryRange(parsed.start, parsed.end));
-    }
-  }
-
-  auto checksum_iter = checksums.begin();
-  for (auto it = as.maps().begin(); it != as.maps().end(); ++it) {
-    AddressSpace::Mapping m = *it;
-    string raw_map_line = m.map.str();
-    uint32_t rec_checksum = 0;
-
-    if (VALIDATE_CHECKSUMS == mode) {
-      ParsedChecksumLine parsed = *checksum_iter;
-      ++checksum_iter;
-      for (; m.map.start() != parsed.start; m = *(++it)) {
-        if (is_task_buffer(as, m)) {
-          // This region corresponds to a task scratch or syscall buffer. We
-          // tear these down a little later during replay so just skip it for
-          // now.
-          continue;
-        }
-        FATAL() << "Segment " << parsed.start << "-" << parsed.end
-                << " changed to " << m.map << "??";
-      }
-      // As |m| may have changed in the above for loop we need to update the
-      // |raw_map_line| too.
-      raw_map_line = m.map.str();
-      ASSERT(t, m.map.end() == parsed.end)
-          << "Segment " << parsed.start << "-" << parsed.end
-          << " changed to " << m.map << "??";
-      if (is_start_of_scratch_region(t, parsed.start)) {
-        /* Replay doesn't touch scratch regions, so
-         * their contents are allowed to diverge.
-         * Tracees can't observe those segments unless
-         * they do something sneaky (or disastrously
-         * buggy). */
-        LOG(debug) << "Not validating scratch starting at " << parsed.start;
-        continue;
-      }
-      if (parsed.checksum == ignored_checksum) {
-        LOG(debug) << "Checksum not computed during recording";
-        continue;
-      } else if (parsed.checksum == sigbus_checksum) {
-        continue;
-      } else {
-        rec_checksum = parsed.checksum;
-      }
-    } else {
-      if (!checksum_segment_filter(m)) {
-        fprintf(c.checksums_file, "(%x) %s\n", ignored_checksum,
-                raw_map_line.c_str());
-        continue;
-      }
-    }
-
-    vector<uint8_t> mem;
-    mem.resize(m.map.size());
-    memset(mem.data(), 0, mem.size());
-    ssize_t valid_mem_len =
-        t->read_bytes_fallible(m.map.start(), mem.size(), mem.data());
-    /* Areas not read are treated as zero. We have to do this because
-       mappings not backed by valid file data are not readable during
-       recording but are read as 0 during replay. */
-    if (valid_mem_len < 0) {
-      /* It is possible for whole mappings to be beyond the extent of the
-       * backing file, in which case read_bytes_fallible will return -1.
-       */
-      ASSERT(t, valid_mem_len == -1 && errno == EIO);
-    }
-
-    if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
-      /* The syscallbuf consists of a region that's written
-      * deterministically wrt the trace events, and a
-      * region that's written nondeterministically in the
-      * same way as trace scratch buffers.  The
-      * deterministic region comprises committed syscallbuf
-      * records, and possibly the one pending record
-      * metadata.  The nondeterministic region starts at
-      * the "extra data" for the possibly one pending
-      * record.
-      *
-      * So here, we set things up so that we only checksum
-      * the deterministic region. */
-      auto child_hdr = m.map.start().cast<struct syscallbuf_hdr>();
-      auto hdr = t->read_mem(child_hdr);
-      mem.resize(sizeof(hdr) + hdr.num_rec_bytes +
-                 sizeof(struct syscallbuf_record));
-    }
-
-    uint32_t checksum = compute_checksum(mem.data(), mem.size());
-
-    if (STORE_CHECKSUMS == mode) {
-      fprintf(c.checksums_file, "(%x) %s\n", checksum, raw_map_line.c_str());
-    } else {
-      ASSERT(t, t->session().is_replaying());
-      auto rt = static_cast<ReplayTask*>(t);
-
-      // Ignore checksums when valid_mem_len == 0
-      if (checksum != rec_checksum) {
-        notify_checksum_error(rt, c.global_time, checksum, rec_checksum,
-                              raw_map_line.c_str());
-      }
-    }
-  }
-
-  if (in_replay_flag) {
-    t->write_mem(in_replay_flag, (unsigned char)1);
-  }
-
-  fclose(c.checksums_file);
-}
-
 bool should_checksum(const Event& event, FrameTime time) {
   FrameTime checksum = Flags::get().checksum;
   if (Flags::CHECKSUM_NONE == checksum) {
@@ -611,12 +451,143 @@ bool should_checksum(const Event& event, FrameTime time) {
   return checksum <= time;
 }
 
-void checksum_process_memory(Task* t, FrameTime global_time) {
-  iterate_checksums(t, STORE_CHECKSUMS, global_time);
+static void normalize_syscallbuf(Task* t, vector<uint8_t>& mem) {
+  /* The syscallbuf consists of a region that's written
+   * deterministically wrt the trace events, and a
+   * region that's written nondeterministically in the
+   * same way as trace scratch buffers.  The
+   * deterministic region comprises committed syscallbuf
+   * records, and possibly the one pending record
+   * metadata.  The nondeterministic region starts at
+   * the "extra data" for the possibly one pending
+   * record.
+   *
+   * The deterministic region excludes the notify_on_syscall_hook_exit
+   * flag. This flag is written by is_safe_to_deliver_signal and
+   * that write can occur at a different event to where ReplaySession
+   * eventually sets it.
+   *
+   * So here, we set things up so that we only checksum
+   * the deterministic region. */
+  struct syscallbuf_hdr hdr;
+  size_t hdr_size = t->session().syscallbuf_hdr_size();
+  ASSERT(t, mem.size() >= hdr_size);
+  memcpy(&hdr, mem.data(), hdr_size);
+  hdr.notify_on_syscall_hook_exit = 0;
+  memcpy(mem.data(), &hdr, hdr_size);
+  mem.resize(hdr_size + hdr.num_rec_bytes + sizeof(struct syscallbuf_record));
 }
 
-void validate_process_memory(Task* t, FrameTime global_time) {
-  iterate_checksums(t, VALIDATE_CHECKSUMS, global_time);
+void checksum_process_memory(RecordTask* t, FrameTime global_time) {
+  string filename = format_dump_filename(t, global_time, "mem_checksums");
+  FILE* checksums_file = fopen64(filename.c_str(), "w");
+  if (!checksums_file) {
+    FATAL() << "Failed to open checksum file " << filename;
+  }
+
+  AddressSpace& as = *t->vm();
+  for (auto it = as.maps().begin(); it != as.maps().end(); ++it) {
+    AddressSpace::Mapping m = *it;
+    string raw_map_line = m.map.str();
+
+    if (!checksum_segment_filter(m)) {
+      fprintf(checksums_file, "(%x) %s\n", ignored_checksum,
+              raw_map_line.c_str());
+      continue;
+    }
+
+    vector<uint8_t> mem;
+    mem.resize(m.map.size());
+    memset(mem.data(), 0, mem.size());
+    ssize_t valid_mem_len =
+        t->read_bytes_fallible(m.map.start(), mem.size(), mem.data());
+    /* Areas not read are treated as zero. We have to do this because
+       mappings not backed by valid file data are not readable during
+       recording but are read as 0 during replay. */
+    if (valid_mem_len < 0) {
+      /* It is possible for whole mappings to be beyond the extent of the
+       * backing file, in which case read_bytes_fallible will return -1.
+       */
+      ASSERT(t, valid_mem_len == -1 && errno == EIO);
+    }
+
+    if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
+      normalize_syscallbuf(t, mem);
+    }
+
+    uint32_t checksum = compute_checksum(mem.data(), mem.size());
+    fprintf(checksums_file, "(%x) %s\n", checksum, raw_map_line.c_str());
+  }
+
+  fclose(checksums_file);
+}
+
+void validate_process_memory(ReplayTask* t, FrameTime global_time) {
+  string filename = format_dump_filename(t, global_time, "mem_checksums");
+  FILE* checksums_file = fopen64(filename.c_str(), "r");
+  if (!checksums_file) {
+    FATAL() << "Failed to open checksum file " << filename;
+  }
+
+  remote_ptr<unsigned char> in_replay_flag;
+  if (t->session().has_trace_quirk(TraceReader::UsesGlobalsInReplay) && t->preload_globals) {
+    in_replay_flag = REMOTE_PTR_FIELD(t->preload_globals, reserved_legacy_in_replay);
+    t->write_mem(in_replay_flag, (unsigned char)0);
+  }
+
+  while (true) {
+    char line[1024];
+    if (!fgets(line, sizeof(line), checksums_file)) {
+      break;
+    }
+    unsigned int checksum;
+    unsigned long start;
+    unsigned long end;
+    int nparsed = sscanf(line, "(%x) %lx-%lx", &checksum, &start, &end);
+    ASSERT(t, 3 == nparsed) << "Parsed " << nparsed << " items";
+
+    if (is_start_of_scratch_region(t, start)) {
+      /* Replay doesn't touch scratch regions, so
+       * their contents are allowed to diverge.
+       * Tracees can't observe those segments unless
+       * they do something sneaky (or disastrously
+       * buggy). */
+      LOG(debug) << "Not validating scratch starting at " << start;
+      continue;
+    }
+
+    if (checksum == ignored_checksum) {
+      LOG(debug) << "Checksum not computed during recording";
+      continue;
+    }
+    if (checksum == sigbus_checksum) {
+      continue;
+    }
+
+    vector<uint8_t> mem;
+    mem.resize(end - start);
+    memset(mem.data(), 0, mem.size());
+    t->read_bytes_fallible(start, mem.size(), mem.data());
+
+    const AddressSpace::Mapping& m = t->vm()->mapping_of(start);
+
+    if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
+      normalize_syscallbuf(t, mem);
+    }
+
+    uint32_t our_checksum = compute_checksum(mem.data(), mem.size());
+
+    if (checksum != our_checksum) {
+      notify_checksum_error(t, global_time, our_checksum, checksum,
+                            m.map.str());
+    }
+  }
+
+  if (in_replay_flag) {
+    t->write_mem(in_replay_flag, (unsigned char)1);
+  }
+
+  fclose(checksums_file);
 }
 
 signal_action default_action(int sig) {
@@ -1081,6 +1052,9 @@ bool cpuid_faulting_works() {
   static bool did_check_cpuid_faulting = false;
   static bool cpuid_faulting_ok = false;
 
+#if !(defined(__i386__) || defined(__x86_64__))
+  did_check_cpuid_faulting = true;
+#endif
   if (did_check_cpuid_faulting) {
     return cpuid_faulting_ok;
   }
@@ -1670,16 +1644,58 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
   return layout;
 }
 
-ScopedFd open_socket(const char* address, unsigned short* port,
-                     ProbePort probe) {
-  ScopedFd listen_fd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+static const char localhost_addr[] = "127.0.0.1";
+static const char localhost_addr_ipv6[] = "::1";
+
+// `addr` must be the right size for for the given domain
+static bool get_address(int domain, const string& host, struct sockaddr* addr) {
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = domain;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  struct addrinfo* ret;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &ret) != 0) {
+    return false;
+  }
+  memcpy(addr, ret->ai_addr, ret->ai_addrlen);
+  freeaddrinfo(ret);
+  return true;
+}
+
+OpenedSocket open_socket(const string& host, unsigned short port,
+                         ProbePort probe) {
+  string host4 = host;
+  string host6 = host;
+  if (host.empty()) {
+    host4 = localhost_addr;
+    host6 = localhost_addr_ipv6;
+  }
+
+  struct sockaddr_in addr4;
+  bool ipv4_ok = get_address(AF_INET, host4, (struct sockaddr*)&addr4);
+  struct sockaddr_in6 addr6;
+  bool ipv6_ok = get_address(AF_INET6, host6, (struct sockaddr*)&addr6);
+
+  int domain = -1;
+  ScopedFd listen_fd;
+  if (ipv4_ok) {
+    listen_fd = ScopedFd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (listen_fd.is_open()) {
+      domain = AF_INET;
+    }
+  }
+  if (!listen_fd.is_open() && ipv6_ok) {
+    listen_fd = ScopedFd(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (listen_fd.is_open()) {
+      domain = AF_INET6;
+    }
+  }
   if (!listen_fd.is_open()) {
     FATAL() << "Couldn't create socket";
   }
 
-  struct sockaddr_in addr;
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = inet_addr(address);
   int reuseaddr = 1;
   int ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
                        sizeof(reuseaddr));
@@ -1687,43 +1703,64 @@ ScopedFd open_socket(const char* address, unsigned short* port,
     FATAL() << "Couldn't set SO_REUSEADDR";
   }
 
+  struct sockaddr* addr;
+  size_t addr_size;
+  in_port_t* addr_port;
+  string* host_out;
+  if (domain == AF_INET) {
+    addr = (struct sockaddr*)&addr4;
+    addr_size = sizeof(addr4);
+    addr_port = &addr4.sin_port;
+    addr4.sin_family = AF_INET;
+    host_out = &host4;
+  } else {
+    addr = (struct sockaddr*)&addr6;
+    addr_size = sizeof(addr6);
+    addr_port = &addr6.sin6_port;
+    addr6.sin6_family = AF_INET6;
+    host_out = &host6;
+  }
+
   do {
-    addr.sin_port = htons(*port);
-    ret = ::bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
+    *addr_port = htons(port);
+    ret = ::bind(listen_fd, addr, addr_size);
     if (ret && probe == PROBE_PORT && (EADDRINUSE == errno || EACCES == errno || EINVAL == errno)) {
-      *port = 0;
+      port = 0;
       continue;
     }
     if (ret) {
-      CLEAN_FATAL() << "Couldn't bind to port " << *port;
+      CLEAN_FATAL() << "Couldn't bind to port " << port;
     }
 
     ret = listen(listen_fd, 1 /*backlogged connection*/);
     if (ret && probe == PROBE_PORT && EADDRINUSE == errno) {
-      *port = 0;
+      port = 0;
       continue;
     }
     if (ret) {
-      FATAL() << "Couldn't listen on port " << *port;
+      FATAL() << "Couldn't listen on port " << port;
     }
-    if (*port == 0) {
-      socklen_t sa_size = sizeof(addr);
-      ret = getsockname(listen_fd, (struct sockaddr*)&addr, &sa_size);
+    if (port == 0) {
+      socklen_t sa_size = addr_size;
+      ret = getsockname(listen_fd, addr, &sa_size);
       if (ret) {
         FATAL() << "Could not get socket port";
       }
 
-      *port = ntohs(addr.sin_port);
+      port = ntohs(*addr_port);
     }
     break;
   } while (probe == PROBE_PORT);
-  return listen_fd;
+
+  OpenedSocket result;
+  result.fd = std::move(listen_fd);
+  result.domain = domain;
+  result.host = *host_out;
+  result.port = port;
+  return result;
 }
 
 void notifying_abort() {
-  flush_log_buffer();
-  dump_rr_stack();
-
   char* test_monitor_pid = getenv("RUNNING_UNDER_TEST_MONITOR");
   if (test_monitor_pid) {
     pid_t pid = atoi(test_monitor_pid);
@@ -1736,19 +1773,19 @@ void notifying_abort() {
   abort();
 }
 
-void dump_rr_stack() {
+void dump_rr_stack(ScopedFd& fd) {
   static const char msg[] = "=== Start rr backtrace:\n";
-  write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+  write_all(fd, msg, sizeof(msg) - 1);
 #ifdef EXECINFO_BACKTRACE
   void* buffer[1024];
   int count = backtrace(buffer, 1024);
-  backtrace_symbols_fd(buffer, count, STDERR_FILENO);
+  backtrace_symbols_fd(buffer, count, fd);
 #else
   static const char msg_fallback[] = "<rr backtraces not available on this system>\n";
-  write_all(STDERR_FILENO, msg_fallback, sizeof(msg_fallback) - 1);
+  write_all(fd, msg_fallback, sizeof(msg_fallback) - 1);
 #endif
   static const char msg2[] = "=== End rr backtrace\n";
-  write_all(STDERR_FILENO, msg2, sizeof(msg2) - 1);
+  write_all(fd, msg2, sizeof(msg2) - 1);
 }
 
 void check_for_leaks() {
@@ -1910,54 +1947,78 @@ static const uint8_t pushf_insn[] = { 0x9c };
 static const uint8_t pushf16_insn[] = { 0x66, 0x9c };
 
 // XXX this probably needs to be extended to decode ignored prefixes
-TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip) {
-  uint8_t insn[sizeof(rdtscp_insn)];
-  ssize_t ret =
-      t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
-  if (ret < 0) {
-    return TrappedInstruction::NONE;
+SpecialInst special_instruction_at(Task* t, remote_code_ptr ip) {
+  if (is_x86ish(t->arch())) {
+    uint8_t insn[sizeof(rdtscp_insn)];
+    ssize_t ret =
+        t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
+    if (ret < 0) {
+      return {SpecialInstOpcode::NONE};
+    }
+    size_t len = ret;
+    if (len >= sizeof(rdtsc_insn) &&
+        !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
+      return {SpecialInstOpcode::X86_RDTSC};
+    }
+    if (len >= sizeof(rdtscp_insn) &&
+        !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
+      return {SpecialInstOpcode::X86_RDTSCP};
+    }
+    if (len >= sizeof(cpuid_insn) &&
+        !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
+      return {SpecialInstOpcode::X86_CPUID};
+    }
+    if (len >= sizeof(int3_insn) &&
+        !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+      return {SpecialInstOpcode::X86_INT3};
+    }
+    if (len >= sizeof(pushf_insn) &&
+        !memcmp(insn, pushf_insn, sizeof(pushf_insn))) {
+      return {SpecialInstOpcode::X86_PUSHF};
+    }
+    if (len >= sizeof(pushf16_insn) &&
+        !memcmp(insn, pushf16_insn, sizeof(pushf16_insn))) {
+      return {SpecialInstOpcode::X86_PUSHF16};
+    }
+  } else if (t->arch() == aarch64) {
+    uint8_t insn[4];
+    ssize_t ret =
+        t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
+    if (ret < 0) {
+      return {SpecialInstOpcode::NONE};
+    }
+    uint32_t insn_word =
+        insn[0] | (insn[1] << 8) | (insn[2] << 16) | (insn[3] << 24);
+    if ((insn_word & 0xffffffe0) == 0xd53be000) {
+      return {SpecialInstOpcode::ARM_MRS_CNTFRQ_EL0, insn_word & 31};
+    }
+    if ((insn_word & 0xffffffe0) == 0xd53be040) {
+      return {SpecialInstOpcode::ARM_MRS_CNTVCT_EL0, insn_word & 31};
+    }
+    if ((insn_word & 0xffffffe0) == 0xd53be0c0) {
+      return {SpecialInstOpcode::ARM_MRS_CNTVCTSS_EL0, insn_word & 31};
+    }
   }
-  size_t len = ret;
-  if (len >= sizeof(rdtsc_insn) &&
-      !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
-    return TrappedInstruction::RDTSC;
-  }
-  if (len >= sizeof(rdtscp_insn) &&
-      !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
-    return TrappedInstruction::RDTSCP;
-  }
-  if (len >= sizeof(cpuid_insn) &&
-      !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
-    return TrappedInstruction::CPUID;
-  }
-  if (len >= sizeof(int3_insn) &&
-      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
-    return TrappedInstruction::INT3;
-  }
-  if (len >= sizeof(pushf_insn) &&
-      !memcmp(insn, pushf_insn, sizeof(pushf_insn))) {
-    return TrappedInstruction::PUSHF;
-  }
-  if (len >= sizeof(pushf16_insn) &&
-      !memcmp(insn, pushf16_insn, sizeof(pushf16_insn))) {
-    return TrappedInstruction::PUSHF16;
-  }
-  return TrappedInstruction::NONE;
+  return {SpecialInstOpcode::NONE};
 }
 
-size_t trapped_instruction_len(TrappedInstruction insn) {
-  if (insn == TrappedInstruction::RDTSC) {
+size_t special_instruction_len(SpecialInstOpcode insn) {
+  if (insn == SpecialInstOpcode::X86_RDTSC) {
     return sizeof(rdtsc_insn);
-  } else if (insn == TrappedInstruction::RDTSCP) {
+  } else if (insn == SpecialInstOpcode::X86_RDTSCP) {
     return sizeof(rdtscp_insn);
-  } else if (insn == TrappedInstruction::CPUID) {
+  } else if (insn == SpecialInstOpcode::X86_CPUID) {
     return sizeof(cpuid_insn);
-  } else if (insn == TrappedInstruction::INT3) {
+  } else if (insn == SpecialInstOpcode::X86_INT3) {
     return sizeof(int3_insn);
-  } else if (insn == TrappedInstruction::PUSHF) {
+  } else if (insn == SpecialInstOpcode::X86_PUSHF) {
     return sizeof(pushf_insn);
-  } else if (insn == TrappedInstruction::PUSHF16) {
+  } else if (insn == SpecialInstOpcode::X86_PUSHF16) {
     return sizeof(pushf16_insn);
+  } else if (insn == SpecialInstOpcode::ARM_MRS_CNTFRQ_EL0 ||
+             insn == SpecialInstOpcode::ARM_MRS_CNTVCT_EL0 ||
+             insn == SpecialInstOpcode::ARM_MRS_CNTVCTSS_EL0) {
+    return 4;
   } else {
     return 0;
   }
@@ -1987,7 +2048,7 @@ bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip) {
   return false;
 }
 
-static string get_cpu_lock_file() {
+string get_cpu_lock_file() {
   const char* lock_file = getenv("_RR_CPU_LOCK_FILE");
   return lock_file ? lock_file : trace_save_dir() + "/cpu_lock";
 }
@@ -2192,6 +2253,77 @@ bool is_directory(const char* path) {
   return (buf.st_mode & S_IFDIR) != 0;
 }
 
+const char* filename(const char* path) {
+  const char* dir = strrchr(path, '/');
+  return dir ? ++dir : path;
+}
+
+bool is_trace(const string& trace) {
+  string ver = trace + "/version";
+  string inc = trace + "/incomplete";
+  return access(ver.c_str(), F_OK) == 0 || access(inc.c_str(), F_OK) == 0;
+}
+
+bool is_latest_trace(const string& trace) {
+  string latest = latest_trace_symlink();
+  if (access(latest.c_str(), F_OK) != 0) {
+    return false;
+  }
+  latest = real_path(latest);
+  return latest == trace; 
+}
+
+bool remove_latest_trace_symlink() {
+  const string latest = latest_trace_symlink();
+  int ret = remove(latest.c_str());
+  if (ret) {
+    perror(latest.c_str());
+    fprintf(stderr,
+            "\n"
+            "rr: Failed to remove latest_trace symlink: error code %d\n"
+            "\n",
+            ret);
+    return false;
+  }
+  return true;
+}
+
+static bool ends_with(std::string_view str, std::string_view suffix) {
+  return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool is_valid_trace_name(const string& entry, std::string* reason) {
+  // filename corresponds to dirname
+  const string name = filename(entry.c_str());
+
+  if (name.empty()) {
+    if (reason) {
+      *reason = "Empty";
+    }
+    return false;
+  }
+  if (name[0] == '.' || name[0] == '#') {
+    if (reason) {
+      *reason = "Cannot start with . or #";
+    }
+    return false;
+  }
+  if (name[name.length() - 1] == '~') {
+    if (reason) {
+      *reason = "Cannot end with ~";
+    }
+    return false;
+  }
+  if (name == "cpu_lock" || name == "src" || ends_with(name, ".xml")) {
+    if (reason) {
+      *reason = "Name " + name + " is reserved";
+    }
+    return false;
+  }
+
+  return true;
+}
+
 ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {
   ssize_t ret = 0;
   while (size) {
@@ -2210,30 +2342,48 @@ ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {
   return ret;
 }
 
-static struct rlimit initial_fd_limit;
+static struct rlimit raise_resource_limit(int resource, rlim_t max_value) {
+  struct rlimit initial;
 
-void raise_resource_limits() {
-  if (getrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
-    FATAL() << "Can't get RLIMIT_NOFILE";
+  if (getrlimit(resource, &initial) < 0) {
+    FATAL() << "Can't get rlimit " << rlimit_resource_name(resource);
   }
 
-  struct rlimit new_limit = initial_fd_limit;
-  // Try raising fd limit to 65536
-  new_limit.rlim_cur = max<rlim_t>(new_limit.rlim_cur, 65536);
+  struct rlimit new_limit = initial;
+  new_limit.rlim_cur = max<rlim_t>(new_limit.rlim_cur, max_value);
   if (new_limit.rlim_max != RLIM_INFINITY) {
     new_limit.rlim_cur = min<rlim_t>(new_limit.rlim_cur, new_limit.rlim_max);
   }
-  if (new_limit.rlim_cur != initial_fd_limit.rlim_cur) {
-    if (setrlimit(RLIMIT_NOFILE, &new_limit) < 0) {
-      LOG(warn) << "Failed to raise file descriptor limit";
+  if (new_limit.rlim_cur != initial.rlim_cur) {
+    if (setrlimit(resource, &new_limit) < 0) {
+      LOG(warn) << "Failed to raise rlimit " << rlimit_resource_name(resource)
+          << " to " << new_limit.rlim_cur;
     }
+  }
+
+  return initial;
+}
+
+static void restore_resource_limit(int resource, const struct rlimit& old_limit) {
+  if (setrlimit(resource, &old_limit) < 0) {
+    LOG(warn) << "Failed to reset rlimit " << rlimit_resource_name(resource);
   }
 }
 
+static const int MAX_TRACEE_TASKS = 65536;
+static struct rlimit initial_fd_limit;
+static struct rlimit initial_memlock_limit;
+
+void raise_resource_limits() {
+  // We need up to 7 perf event counters per tracee task
+  initial_fd_limit = raise_resource_limit(RLIMIT_NOFILE, 1024 + 7 * MAX_TRACEE_TASKS);
+  // We may need one page of locked memory per tracee task
+  initial_memlock_limit = raise_resource_limit(RLIMIT_MEMLOCK, page_size() * 1 * MAX_TRACEE_TASKS);
+}
+
 void restore_initial_resource_limits() {
-  if (setrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
-    LOG(warn) << "Failed to reset file descriptor limit";
-  }
+  restore_resource_limit(RLIMIT_NOFILE, initial_fd_limit);
+  restore_resource_limit(RLIMIT_MEMLOCK, initial_memlock_limit);
 }
 
 template <typename Arch> static size_t word_size_arch() {
@@ -2462,4 +2612,42 @@ int parse_tid_from_proc_path(const std::string& pathname,
   }
   return -1;
 }
+
+void replace_in_buffer(MemoryRange src, const uint8_t* src_data,
+                       MemoryRange dst, uint8_t* dst_data) {
+  remote_ptr<void> overlap_start = max(src.start(), dst.start());
+  remote_ptr<void> overlap_end = min(src.end(), dst.end());
+  if (overlap_start < overlap_end) {
+    memcpy(dst_data + (overlap_start - dst.start()),
+           src_data + (overlap_start - src.start()),
+           overlap_end - overlap_start);
+  }
+}
+
+void base_name(string& s) {
+  size_t p = s.rfind('/');
+  if (p != string::npos) {
+    s.erase(0, p + 1);
+  }
+}
+
+static optional<int> init_read_perf_event_paranoid() {
+  ScopedFd fd("/proc/sys/kernel/perf_event_paranoid", O_RDONLY);
+  if (fd.is_open()) {
+    char buf[100];
+    ssize_t size = read(fd, buf, sizeof(buf) - 1);
+    if (size >= 0) {
+      buf[size] = 0;
+      return atoi(buf);
+    }
+  }
+
+  return nullopt;
+}
+
+optional<int> read_perf_event_paranoid() {
+  static optional<int> value = init_read_perf_event_paranoid();
+  return value;
+}
+
 } // namespace rr

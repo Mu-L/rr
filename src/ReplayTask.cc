@@ -126,8 +126,9 @@ void ReplayTask::validate_regs(uint32_t flags) {
   }
 
   /* TODO: add perf counter validations (hw int, page faults, insts) */
-  Registers::compare_register_files(this, "replaying", regs(), "recorded",
-                                    rec_regs, BAIL_ON_MISMATCH);
+  Registers::Comparison comparison = regs().compare_with(rec_regs);
+  ASSERT(this, !comparison.mismatch_count) << "Mismatched registers, replay vs rec: "
+      << comparison;
 }
 
 const TraceFrame& ReplayTask::current_trace_frame() {
@@ -138,26 +139,59 @@ FrameTime ReplayTask::current_frame_time() {
   return current_trace_frame().time();
 }
 
-ssize_t ReplayTask::set_data_from_trace() {
-  auto buf = trace_reader().read_raw_data();
-  if (!buf.addr.is_null() && buf.data.size() > 0) {
-    auto t = session().find_task(buf.rec_tid);
-    t->write_bytes_helper(buf.addr, buf.data.size(), buf.data.data());
-    t->vm()->maybe_update_breakpoints(t, buf.addr.cast<uint8_t>(),
-                                      buf.data.size());
+// Returns number of bytes written (including holes)
+static size_t write_data_with_holes(ReplayTask* t,
+                                    const TraceReader::RawDataWithHoles& buf) {
+  unique_ptr<AutoRemoteSyscalls> remote;
+  size_t data_offset = 0;
+  size_t addr_offset = 0;
+  auto holes_iter = buf.holes.begin();
+  while (data_offset < buf.data.size() || holes_iter != buf.holes.end()) {
+    if (holes_iter != buf.holes.end() && holes_iter->offset == addr_offset) {
+      t->write_zeroes(&remote, buf.addr + addr_offset, holes_iter->size);
+      addr_offset += holes_iter->size;
+      ++holes_iter;
+      continue;
+    }
+    size_t data_end = buf.data.size();
+    if (holes_iter != buf.holes.end()) {
+      data_end = data_offset + holes_iter->offset - addr_offset;
+    }
+    bool ok = true;
+    ssize_t nwritten = t->write_bytes_helper(buf.addr + addr_offset, data_end - data_offset,
+                                             buf.data.data() + data_offset,&ok);
+
+    ASSERT(t, ok || buf.size_validation == MemWriteSizeValidation::CONSERVATIVE)
+        << "Should have written " << buf.data.size() << " bytes to " << (buf.addr + addr_offset)
+        << ", but only wrote " << nwritten;
+
+    addr_offset += data_end - data_offset;
+    data_offset = data_end;
   }
-  return buf.data.size();
+  return addr_offset;
+}
+
+void ReplayTask::apply_data_record_from_trace() {
+  TraceReader::RawDataWithHoles buf;
+  bool ok = trace_reader().read_raw_data_for_frame_with_holes(buf);
+  ASSERT(this, ok);
+  if (buf.addr.is_null()) {
+    return;
+  }
+  auto t = session().find_task(buf.rec_tid);
+  size_t size = write_data_with_holes(t, buf);
+  t->vm()->maybe_update_breakpoints(t, buf.addr.cast<uint8_t>(), size);
 }
 
 void ReplayTask::apply_all_data_records_from_trace() {
-  TraceReader::RawData buf;
-  while (trace_reader().read_raw_data_for_frame(buf)) {
-    if (!buf.addr.is_null() && buf.data.size() > 0) {
-      auto t = session().find_task(buf.rec_tid);
-      t->write_bytes_helper(buf.addr, buf.data.size(), buf.data.data());
-      t->vm()->maybe_update_breakpoints(t, buf.addr.cast<uint8_t>(),
-                                        buf.data.size());
+  TraceReader::RawDataWithHoles buf;
+  while (trace_reader().read_raw_data_for_frame_with_holes(buf)) {
+    if (buf.addr.is_null()) {
+      continue;
     }
+    auto t = session().find_task(buf.rec_tid);
+    size_t size = write_data_with_holes(t, buf);
+    t->vm()->maybe_update_breakpoints(t, buf.addr.cast<uint8_t>(), size);
   }
 }
 
@@ -180,6 +214,13 @@ void ReplayTask::set_real_tid_and_update_serial(pid_t tid) {
   hpc.set_tid(tid);
   this->tid = tid;
   serial = session().next_task_serial();
+}
+
+const ExtraRegisters& ReplayTask::extra_regs() {
+  if (!extra_regs_fallible()) {
+    ASSERT(this, false) << "Can't find task for infallible extra_regs";
+  }
+  return extra_registers;
 }
 
 bool ReplayTask::post_vm_clone(CloneReason reason, int flags, Task* origin) {

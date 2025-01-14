@@ -1,7 +1,7 @@
 from util import *
 import re
 
-send_gdb('watch num_signals_caught')
+send_gdb('watch -l num_signals_caught')
 expect_gdb('Hardware watchpoint 1')
 
 send_gdb('c')
@@ -25,6 +25,6 @@ send_gdb('reverse-stepi')
 expect_gdb('received signal')
 
 send_gdb('reverse-continue')
-expect_gdb('stopped')
+expect_gdb('No more reverse-execution history')
 
 ok()

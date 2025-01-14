@@ -48,10 +48,12 @@ Session::Session()
       next_task_serial_(1),
       rrcall_base_(RR_CALL_BASE),
       syscallbuf_fds_disabled_size_(SYSCALLBUF_FDS_DISABLED_SIZE),
+      syscallbuf_hdr_size_(sizeof(syscallbuf_hdr)),
       syscall_seccomp_ordering_(PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN),
       ticks_semantics_(PerfCounters::default_ticks_semantics()),
       done_initial_exec_(false),
-      visible_execution_(true) {
+      visible_execution_(true),
+      intel_pt_(false) {
   LOG(debug) << "Session " << this << " created";
 }
 
@@ -64,18 +66,21 @@ Session::~Session() {
   }
 }
 
-Session::Session(const Session& other) {
-  statistics_ = other.statistics_;
-  next_task_serial_ = other.next_task_serial_;
-  done_initial_exec_ = other.done_initial_exec_;
-  rrcall_base_ = other.rrcall_base_;
-  visible_execution_ = other.visible_execution_;
-  tracee_socket = other.tracee_socket;
-  tracee_socket_receiver = other.tracee_socket_receiver;
-  tracee_socket_fd_number = other.tracee_socket_fd_number;
-  ticks_semantics_ = other.ticks_semantics_;
-  original_affinity_ = other.original_affinity_;
-}
+Session::Session(const Session& other)
+    : statistics_(other.statistics_),
+      tracee_socket(other.tracee_socket),
+      tracee_socket_receiver(other.tracee_socket_receiver),
+      tracee_socket_fd_number(other.tracee_socket_fd_number),
+      next_task_serial_(other.next_task_serial_),
+      rrcall_base_(other.rrcall_base_),
+      syscallbuf_fds_disabled_size_(other.syscallbuf_fds_disabled_size_),
+      syscallbuf_hdr_size_(other.syscallbuf_hdr_size_),
+      syscall_seccomp_ordering_(other.syscall_seccomp_ordering_),
+      ticks_semantics_(other.ticks_semantics_),
+      original_affinity_(other.original_affinity_),
+      done_initial_exec_(other.done_initial_exec_),
+      visible_execution_(other.visible_execution_),
+      intel_pt_(other.intel_pt_) {}
 
 void Session::on_create(ThreadGroup* tg) { thread_group_map_[tg->tguid()] = tg; }
 void Session::on_destroy(ThreadGroup* tg) {
@@ -216,7 +221,7 @@ void Session::kill_all_tasks() {
     /* We delete tasks in two passes. First, we kill
      * every non-thread-group-leader, then we kill every group leader.
      * Linux expects threads group leaders to survive until the last
-     * member of the thread group has exited, so we accomodate that.
+     * member of the thread group has exited, so we accommodate that.
      */
     for (auto& v : task_map) {
       Task* t = v.second;
@@ -486,24 +491,29 @@ KernelMapping Session::create_shared_mmap(
   if (!required_child_addr.is_null()) {
     flags |= MAP_FIXED;
   }
-  KernelMapping km = t->vm()->map(
-      t, child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
-      path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
-      std::move(monitored));
 
   int child_shmem_fd = remote.infallible_send_fd_if_alive(shmem_fd);
   if (child_shmem_fd < 0) {
-    return km;
+    return KernelMapping();
   }
   LOG(debug) << "created shmem segment " << path;
 
   // Map the segment in ours and the tracee's address spaces.
-  remote.infallible_mmap_syscall_if_alive(
+  remote_ptr<void> addr = remote.infallible_mmap_syscall_if_alive(
       child_map_addr, size, tracee_prot, flags | MAP_FIXED, child_shmem_fd, 0);
-  if (!child_map_addr) {
-    // tracee unexpectedly died
-    return km;
+  if (!addr) {
+    // tracee unexpectedly died.
+    // We leak the fd; cleaning it up is probably impossible/unnecessary.
+    return KernelMapping();
   }
+
+  // Note the mapping after we successfully created it in the child.
+  // If the child mapping fails for some reason (e.g. SIGKILL) we still
+  // want our cache to be correct (and not contain the mapping).
+  KernelMapping km = t->vm()->map(
+      t, child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
+      path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
+      std::move(monitored));
 
   remote.infallible_close_syscall_if_alive(child_shmem_fd);
   return km;
@@ -550,9 +560,22 @@ const AddressSpace::Mapping Session::recreate_shared_mmap(
   uint32_t flags = m.flags;
   size_t size = m.map.size();
   void* preserved_data = preserve == PRESERVE_CONTENTS ? m.local_addr : nullptr;
-  if (preserved_data) {
-    remote.task()->vm()->detach_local_mapping(m.map.start());
+  void* remote_task_local_mapping = nullptr;
+
+  {
+    // Note that Mapping `m` may correspond to a Mapping from a different Task
+    // than the `maybe_detach_mapping`. See replay_syscall.cc prepare_clone()
+    // for an example.
+    auto remote_task_mapping = remote.task()->vm()->mapping_of(m.map.start());
+
+    // Sanity check
+    ASSERT(remote.task(), size == remote_task_mapping.map.size());
+    ASSERT(remote.task(), m.map.start() == remote_task_mapping.map.start());
+
+    remote_task_local_mapping =
+        remote.task()->vm()->detach_local_mapping(m.map.start());
   }
+
   remote_ptr<void> new_addr =
       create_shared_mmap(remote, m.map.size(), m.map.start(),
                          extract_name(name, sizeof(name)), m.map.prot(), 0,
@@ -565,13 +588,15 @@ const AddressSpace::Mapping Session::recreate_shared_mmap(
     new_map = remote.task()->vm()->mapping_of(new_addr);
     if (preserved_data) {
       memcpy(new_map.local_addr, preserved_data, size);
-      munmap(preserved_data, size);
     }
+  }
+  if (remote_task_local_mapping) {
+    munmap(remote_task_local_mapping, size);
   }
   return new_map;
 }
 
-const AddressSpace::Mapping& Session::steal_mapping(
+AddressSpace::Mapping Session::steal_mapping(
     AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
     MonitoredSharedMemory::shr_ptr monitored) {
   // We will include the name of the full path of the original mapping in the
@@ -616,7 +641,7 @@ void Session::make_private_shared(AutoRemoteSyscalls& remote,
   // segment as it's scratch space, reevaluate that choice
   AutoRemoteSyscalls remote2(remote.task());
 
-  const AddressSpace::Mapping& new_m = steal_mapping(remote2, m);
+  AddressSpace::Mapping new_m = steal_mapping(remote2, m);
 
   if (!new_m.local_addr) {
     return;
@@ -645,9 +670,8 @@ static vector<uint8_t> capture_syscallbuf(const AddressSpace::Mapping& m,
     // so just record the entire buffer. This should not be common.
     data_size = m.map.size();
   } else {
-    data_size = clone_leader->read_mem(
-                    REMOTE_PTR_FIELD(syscallbuf_hdr, num_rec_bytes)) +
-                sizeof(struct syscallbuf_hdr);
+    data_size = clone_leader->read_mem(REMOTE_PTR_FIELD(syscallbuf_hdr, num_rec_bytes)) +
+        clone_leader->session().syscallbuf_hdr_size();
   }
   return clone_leader->read_mem(start, data_size);
 }
@@ -753,6 +777,10 @@ static bool set_cpu_affinity(int cpu) {
 }
 
 void Session::do_bind_cpu() {
+  if (intel_pt_) {
+    PerfCounters::start_pt_copy_thread();
+  }
+
   sched_getaffinity(0, sizeof(original_affinity_), &original_affinity_);
 
   int cpu_index = this->cpu_binding();
@@ -783,6 +811,10 @@ void Session::do_bind_cpu() {
       (void)choose_cpu((BindCPU)cpu_index, cpu_lock);
     }
   }
+}
+
+bool Session::mark_stdio() const {
+  return visible_execution_ && Flags::get().mark_stdio;
 }
 
 } // namespace rr

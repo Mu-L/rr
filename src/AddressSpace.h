@@ -56,6 +56,7 @@ public:
                                     MAP_PRIVATE | MAP_SHARED | MAP_STACK |
                                     MAP_GROWSDOWN;
   static const int checkable_flags_mask = MAP_PRIVATE | MAP_SHARED;
+  static const int checkable_prot_mask = PROT_READ | PROT_WRITE | PROT_EXEC;
   static const dev_t NO_DEVICE = 0;
   static const ino_t NO_INODE = 0;
 
@@ -115,6 +116,10 @@ public:
     return KernelMapping(start(), end(), fsname_, device_, inode_, prot, flags_,
                          offset);
   }
+  KernelMapping set_fsname(const std::string& name) const {
+    return KernelMapping(start(), end(), name, device_, inode_, prot_, flags_,
+                         offset);
+  }
 
   /**
    * Dump a representation of |this| to a string in a format
@@ -148,6 +153,9 @@ public:
   bool is_stack() const { return fsname().find("[stack") == 0; }
   bool is_vvar() const { return fsname() == "[vvar]"; }
   bool is_vsyscall() const { return fsname() == "[vsyscall]"; }
+  bool is_named_anonymous() const {
+    return fsname().find("[anon:") == 0 || fsname().find("[anon_shmem:") == 0;
+  }
 
   struct stat fake_stat() const {
     struct stat fake_stat;
@@ -273,6 +281,8 @@ public:
       new (this) Mapping(other);
       return *this;
     }
+    Mapping subrange(MemoryRange range,
+                     std::function<KernelMapping(const KernelMapping&)> f) const;
 
     const KernelMapping map;
     // The corresponding KernelMapping in the recording. During recording,
@@ -302,7 +312,9 @@ public:
       // This mapping is used for syscallbuf patch stubs
       IS_PATCH_STUBS = 0x4,
       // This mapping is the rr page
-      IS_RR_PAGE = 0x8
+      IS_RR_PAGE = 0x8,
+      // This mapping is the rr vdso page
+      IS_RR_VDSO_PAGE = 0x10,
     };
     uint32_t flags;
   };
@@ -366,6 +378,10 @@ public:
 
   remote_ptr<void> interp_base() const { return interp_base_; }
   void set_interp_base(remote_ptr<void> base) { interp_base_ = base; }
+
+  // Set anonymous region name as per PR_SET_VMA_ANON_NAME.
+  // Stops at the first unmapped memory page.
+  void set_anon_name(Task* t, MemoryRange range, const std::string* name);
 
   /**
    * Assuming the last retired instruction has raised a SIGTRAP
@@ -759,12 +775,12 @@ public:
   static remote_ptr<uint8_t> rr_page_record_ff_bytes() { return RR_PAGE_FF_BYTES; }
 
   /**
-   * Locate a syscall instruction in t's VDSO.
+   * Locate a syscall instruction in t's VDSO (the real one, not our fake one).
    * This gives us a way to execute remote syscalls without having to write
    * a syscall instruction into executable tracee memory (which might not be
    * possible with some kernels, e.g. PaX).
    */
-  remote_code_ptr find_syscall_instruction(Task* t);
+  remote_code_ptr find_syscall_instruction_in_vdso(Task* t);
 
   /**
    * Task |t| just forked from this address space. Apply dont_fork and
@@ -867,7 +883,13 @@ public:
   };
 
   void map_rr_page(AutoRemoteSyscalls& remote);
-  void unmap_all_but_rr_page(AutoRemoteSyscalls& remote);
+  static std::vector<uint8_t> read_rr_page_for_recording(SupportedArch arch);
+  struct UnmapOptions {
+    bool exclude_vdso_vvar;
+    UnmapOptions() : exclude_vdso_vvar(false) {}
+  };
+  void unmap_all_but_rr_mappings(AutoRemoteSyscalls& remote,
+                                 UnmapOptions options = UnmapOptions());
 
   void erase_task(Task* t) {
     this->HasTaskSet::erase_task(t);
@@ -888,6 +910,17 @@ public:
   // Whether to return WatchConfigs consisting of only aligned locations
   // suitable for hardware watchpoint registers.
   enum WatchpointAlignment { UNALIGNED, ALIGNED };
+
+  // Returns true if the range is completely covered by private mappings
+  bool range_is_private_mapping(const MemoryRange& range) const;
+
+  /**
+   * When two processes share an address space (e.g. with vfork(2) or
+   * clone(2) CLONE_VM), and one process calls execve(2), we need to unmap
+   * that process's syscallbuf. This list is checked the next time a task
+   * in that address space runs to perform the unmapping
+   */
+  std::vector<MemoryRange> regions_pending_unmap;
 
 private:
   struct Breakpoint;
@@ -914,6 +947,7 @@ private:
   void populate_address_space(Task* t);
 
   void unmap_internal(Task* t, remote_ptr<void> addr, ssize_t num_bytes);
+  void update_syscall_ips(Task* t);
 
   bool update_watchpoint_value(const MemoryRange& range,
                                Watchpoint& watchpoint);
@@ -1222,8 +1256,8 @@ private:
  */
 class KernelMapIterator {
 public:
-  KernelMapIterator(Task* t);
-  KernelMapIterator(pid_t tid) : tid(tid) { init(); }
+  KernelMapIterator(Task* t, bool* ok = nullptr);
+  KernelMapIterator(pid_t tid, bool* ok = nullptr) : tid(tid) { init(ok); }
   ~KernelMapIterator();
 
   // It's very important to keep in mind that btrfs files can have the wrong
@@ -1238,7 +1272,7 @@ public:
   void operator++();
 
 private:
-  void init();
+  void init(bool* ok = nullptr);
 
   pid_t tid;
   FILE* maps_file;

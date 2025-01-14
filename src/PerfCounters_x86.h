@@ -66,8 +66,11 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0x706a0:
     case 0x506c0:
       return IntelGoldmont;
+    case 0x906c0:
+      return IntelTremont;
     case 0x706e0:
     case 0x606a0:
+    case 0x80660:
       return IntelIcelake;
     case 0x806c0:
     case 0x806d0:
@@ -84,32 +87,62 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0x906a0:
       return IntelAlderlake;
     case 0xb0670:
+    case 0xb06a0:
+    case 0xb06f0:
       return IntelRaptorlake;
-    case 0x30f00:
-      return AMDF15R30;
-    case 0x00f10: // Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
-    case 0x10f10: // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
-    case 0x10f80: // Banded Kestrel (Zen), Picasso (Zen+) (UNTESTED)
-    case 0x20f00: // Dali (Zen) (UNTESTED)
-    case 0x00f80: // Colfax, Pinnacle Ridge (Zen+) (UNTESTED)
-    case 0x30f10: // Rome, Castle Peak (Zen 2)
-    case 0x60f00: // Renoir (Zen 2) (UNTESTED)
-    case 0x70f10: // Matisse (Zen 2) (UNTESTED)
-    case 0x60f80: // Lucienne
-    case 0x90f00: // Van Gogh (Zen 2)
-      if (ext_family == 8 || ext_family == 0xa) {
+    case 0x806f0:
+      return IntelSapphireRapid;
+    case 0xc06f0:
+      return IntelEmeraldRapid;
+    case 0xa06a0:
+      return IntelMeteorLake;
+    case 0xf20:  // Piledriver
+    case 0x30f00:  // Steamroller
+      return AMDF15;
+    case 0x00f10: // A8-3530MX, Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
+      if (ext_family == 8) {
         return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen3;
       } else if (ext_family == 3) {
-        return AMDF15R30;
+        return AMDF15;
+      }
+      break;
+    case 0x00f80: // Colfax, Pinnacle Ridge (Zen+), Chagall (Zen3) (UNTESTED)
+      if (ext_family == 8) {
+        return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen3;
+      }
+      break;
+    case 0x10f10: // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
+    case 0x10f80: // Banded Kestrel (Zen), Picasso (Zen+), 7975WX (Zen2)
+    case 0x20f00: // Dali (Zen)
+      if (ext_family == 8) {
+        return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen2;
+      }
+      break;
+    case 0x30f10: // Rome, Castle Peak (Zen 2)
+    case 0x60f00: // Renoir (Zen 2)
+    case 0x70f10: // Matisse (Zen 2)
+    case 0x60f80: // Lucienne (Zen 2)
+    case 0x90f00: // Van Gogh (Zen 2)
+      if (ext_family == 8) {
+        return AMDZen2;
       }
       break;
     case 0x20f10: // Vermeer (Zen 3)
     case 0x50f00: // Cezanne (Zen 3)
     case 0x40f40: // Rembrandt (Zen 3+)
+      return AMDZen3;
     case 0x60f10: // Raphael (Zen 4)
-      if (ext_family == 0xa) {
-        return AMDZen;
-      }
+    case 0x70f40: // Phoenix (Zen 4)
+    case 0x70f50: // Hawk Point (Zen 4)
+      return AMDZen4;
+    case 0x20f40: // Strix Point (Zen 5)
+      return AMDZen5;
     default:
       break;
   }
@@ -313,10 +346,12 @@ static void check_for_zen_speclockmap() {
       LOG(debug) << "SpecLockMap is disabled";
     } else {
       LOG(debug) << "SpecLockMap is not disabled";
-      fprintf(stderr,
-              "On Zen CPUs, rr will not work reliably unless you disable the "
-              "hardware SpecLockMap optimization.\nFor instructions on how to "
-              "do this, see https://github.com/rr-debugger/rr/wiki/Zen\n");
+      if (!Flags::get().suppress_environment_warnings) {
+        fprintf(stderr,
+                "On Zen CPUs, rr will not work reliably unless you disable the "
+                "hardware SpecLockMap optimization.\nFor instructions on how to "
+                "do this, see https://github.com/rr-debugger/rr/wiki/Zen\n");
+      }
     }
   }
 }
@@ -365,7 +400,7 @@ static void check_for_arch_bugs(perf_event_attrs &perf_attr) {
   if (uarch >= IntelCometlake && uarch <= LastIntel) {
     check_for_freeze_on_smi();
   }
-  if (uarch == AMDZen) {
+  if (uarch >= AMDZen && uarch <= LastAMD) {
     check_for_zen_speclockmap();
   }
 }
