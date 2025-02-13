@@ -7,17 +7,14 @@ struct {
   uint32_t high;
 } value;
 
-static void breakpoint(void) {
-  // Put something in here so the optimizer can't eat this function.
-  atomic_puts(".");
-}
-
 int main(void) {
-  breakpoint();
-
-  // -O3 should consolidate these into a single load.
+  // -O3 should consolidate these into a single store.
   value.low = 1;
   value.high = 2;
+
+  // This will fail; we just want the compiler to not optimize out
+  // the store.
+  test_assert(-1 == write(-1, &value, sizeof(value)));
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

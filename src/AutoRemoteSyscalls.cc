@@ -20,6 +20,7 @@
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
+#include "record_signal.h"
 #include "util.h"
 
 using namespace std;
@@ -45,6 +46,11 @@ void AutoRestoreMem::init(const void* mem, ssize_t num_bytes) {
 
   remote.regs().set_sp(remote.regs().sp() - len);
   remote.task()->set_regs(remote.regs());
+  if (remote.task()->is_exiting()) {
+    // Leave addr == nullptr
+    return;
+  }
+
   addr = remote.regs().sp();
 
   data.resize(len);
@@ -92,7 +98,8 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
       use_singlestep_path(false),
       enable_mem_params_(enable_mem_params),
       restore_sigmask(false),
-      need_sigpending_renable(false) {
+      need_sigpending_renable(false),
+      need_desched_event_reenable(false) {
   if (initial_at_seccomp) {
     // This should only ever happen during recording - we don't use the
     // seccomp traps during replay.
@@ -137,15 +144,28 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
   }
   if (t->session().is_recording()) {
     RecordTask *rt = static_cast<RecordTask*>(t);
+    sig_set_t signals_to_block = 0;
+
     if (rt->schedule_frozen) {
       // If we're explicitly controlling the schedule, make sure not to accidentally run
       // any signals that we were not meant to be able to see.
+      memset(&signals_to_block, 0xff, sizeof(sig_set_t));
+    }
+    if (desched_event_armed(rt)) {
+      // If the desched event is enabled, we need to disable it, so that we don't get
+      // the desched signal interrupting the syscall we're trying to make. We also
+      // need to mask it, so that if there's a pending desched signal from before
+      // we disable it, we don't accidently steal it.
+      signals_to_block |= signal_bit(rt->session().syscallbuf_desched_sig());
+      need_desched_event_reenable = true;
+      disarm_desched_event(rt);
+    }
+
+    if (signals_to_block) {
       restore_sigmask = true;
       sigmask_to_restore = rt->get_sigmask();
-      sig_set_t all_blocked;
-      memset(&all_blocked, 0xff, sizeof(all_blocked));
       // Ignore the process dying here - we'll notice later.
-      (void)rt->set_sigmask(all_blocked);
+      (void)rt->set_sigmask(signals_to_block | sigmask_to_restore);
     }
   }
 }
@@ -241,8 +261,12 @@ void AutoRemoteSyscalls::maybe_fix_stack_pointer() {
 AutoRemoteSyscalls::~AutoRemoteSyscalls() { restore_state_to(t); }
 
 void AutoRemoteSyscalls::restore_state_to(Task* t) {
+  // Check if the task was unexpectedly killed via SIGKILL or equivalent.
+  bool is_exiting = !t->is_stopped() || t->ptrace_event() == PTRACE_EVENT_EXIT ||
+    t->was_reaped();
+
   // Unmap our scatch region if required
-  if (scratch_mem_was_mapped) {
+  if (scratch_mem_was_mapped && !is_exiting) {
     AutoRemoteSyscalls remote(t, DISABLE_MEMORY_PARAMS);
     remote.infallible_syscall(syscall_number_for_munmap(arch()),
                               fixed_sp - 4096, 4096);
@@ -255,6 +279,14 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
   auto regs = initial_regs;
   regs.set_ip(initial_ip);
   regs.set_sp(initial_sp);
+  if (is_exiting) {
+    // Don't restore status; callers need to see the task is exiting.
+    // And the other stuff we don't below won't work.
+    // But do restore registers so it looks like the exit happened in a clean state.
+    t->set_regs(regs);
+    return;
+  }
+
   if (t->arch() == aarch64 && regs.syscall_may_restart()) {
     // On AArch64, the kernel restarts aborted syscalls using an internal `orig_x0`.
     // This gets overwritten everytime we make a syscall so we need to restore it
@@ -270,7 +302,11 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
     regs.set_arg1(regs.orig_arg1());
     t->set_regs(regs);
     if (t->enter_syscall(true)) {
-      t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+      if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+        // Tracee died unexpectedly, there is nothing more we can do.
+        // Do not restore the status, we want callers to see that the task died.
+        return;
+      }
     }
     regs.set_ip(initial_ip);
     regs.set_syscallno(regs.original_syscallno());
@@ -286,7 +322,11 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
     t->set_regs(regs);
     RecordTask* rt = static_cast<RecordTask*>(t);
     while (true) {
-      rt->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+      if (!rt->resume_execution(RESUME_CONT, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+        // Tracee died unexpectedly, there is nothing more we can do.
+        // Do not restore the status, we want callers to see that the task died.
+        return;
+      }
       if (rt->ptrace_event())
         break;
       rt->stash_sig();
@@ -300,12 +340,17 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
   if (restore_sigmask) {
     static_cast<RecordTask*>(t)->set_sigmask(sigmask_to_restore);
   }
+  if (need_desched_event_reenable) {
+    arm_desched_event(static_cast<RecordTask*>(t));
+  }
   if (need_sigpending_renable) {
     // The purpose of this PTRACE_INTERRUPT is to re-enable TIF_SIGPENDING on
     // the tracee, without forcing any actual signals on it. Since PTRACE_INTERRUPT
     // needs to be able to interrupt re-startable system calls, it is required
     // to set TIF_SIGPENDING, but the fact that this works is of course a very
     // deep implementation detail.
+    // If this fails then the tracee must be dead or no longer traced, in which
+    // case we no longer care about its TIF_SIGPENDING status.
     t->do_ptrace_interrupt();
   }
 }
@@ -327,10 +372,12 @@ static bool ignore_signal(Task* t) {
     return true;
   }
   siginfo_t siginfo;
-  if (t->ptrace_if_alive(PTRACE_GETSIGINFO, nullptr, &siginfo)) {
-    ASSERT(t, false) << "Unexpected signal " << siginfo;
-  } else {
+  errno = 0;
+  t->fallible_ptrace(PTRACE_GETSIGINFO, nullptr, &siginfo);
+  if (errno) {
     ASSERT(t, false) << "Unexpected signal " << signal_name(sig);
+  } else {
+    ASSERT(t, false) << "Unexpected signal " << siginfo;
   }
   return false;
 }
@@ -338,8 +385,9 @@ static bool ignore_signal(Task* t) {
 long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   LOG(debug) << "syscall " << syscall_name(syscallno, t->arch()) << " " << callregs;
 
-  if (t->is_dying()) {
+  if (t->is_exiting()) {
     LOG(debug) << "Task is dying, don't try anything.";
+    ASSERT(t, t->stopped_or_unexpected_exit()) << "Already seen exit event";
     return -ESRCH;
   }
 
@@ -361,15 +409,15 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   bool from_seccomp = initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP;
   if (use_singlestep_path && !from_seccomp) {
     while (true) {
-      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
+      if (!t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+        // Tracee was killed, there is nothing more we can do.
+        ASSERT(t, t->stopped_or_unexpected_exit()) << "Couldn't singlestep";
+        return -ESRCH;
+      }
       LOG(debug) << "Used singlestep path; status=" << t->status();
       // When a PTRACE_EVENT_EXIT is returned we don't update registers
       if (t->ip() != callregs.ip()) {
         // We entered the syscall, so stop now
-        break;
-      }
-      if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
-        // We died, just let it be
         break;
       }
       if (t->stop_sig() == SIGTRAP && t->get_siginfo().si_code == TRAP_TRACE) {
@@ -385,25 +433,26 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
       ASSERT(t, false) << "Unexpected status " << t->status();
     }
   } else {
-    bool exited = false;
     if (from_seccomp) {
       LOG(debug) << "Skipping enter_syscall - already at seccomp stop";
     } else {
-      exited = !t->enter_syscall(true);
+      if (!t->enter_syscall(true)) {
+        // Tracee was killed, there is nothing more we can do.
+        // Ensure callers see the task death status.
+        ASSERT(t, t->stopped_or_unexpected_exit()) << "couldn't enter syscall";
+        return -ESRCH;
+      }
       LOG(debug) << "Used enter_syscall; status=" << t->status();
     }
-    // proceed to syscall exit
-    if (!exited) {
-      t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
-      LOG(debug) << "syscall exit status=" << t->status();
+    if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+      // Tracee was killed, there is nothing more we can do.
+      // Ensure callers see the task death status.
+      ASSERT(t, t->stopped_or_unexpected_exit()) << "couldn't resume syscall";
+      return -ESRCH;
     }
+    LOG(debug) << "syscall exit status=" << t->status();
   }
   while (true) {
-    // If the syscall caused the task to exit, just stop now with that status.
-    if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
-      restore_wait_status = t->status();
-      break;
-    }
     if (t->status().is_syscall() ||
         (t->stop_sig() == SIGTRAP &&
          is_kernel_trap(t->get_siginfo().si_code))) {
@@ -413,19 +462,28 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
     }
     if (is_clone_syscall(syscallno, t->arch()) &&
         t->clone_syscall_is_complete(&new_tid_, t->arch())) {
-      t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+      if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+        // Tracee was killed, there is nothing more we can do.
+        ASSERT(t, t->stopped_or_unexpected_exit()) << "Couldn't resume clone";
+        return -ESRCH;
+      }
       LOG(debug) << "got clone event; new status=" << t->status();
       continue;
     }
     if (ignore_signal(t)) {
       if (t->regs().syscall_may_restart()) {
         if (!t->enter_syscall(true)) {
-          // We died, just let it be
-          break;
+          // Tracee was killed, there is nothing more we can do.
+          ASSERT(t, t->stopped_or_unexpected_exit()) << "Couldn't restart";
+          return -ESRCH;
         }
         LOG(debug) << "signal ignored; restarting syscall, status="
                    << t->status();
-        t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+        if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+          // Tracee was killed, there is nothing more we can do.
+          ASSERT(t, t->stopped_or_unexpected_exit()) << "Couldn't resume restart";
+          return -ESRCH;
+        }
         LOG(debug) << "syscall exit status=" << t->status();
         continue;
       }
@@ -438,13 +496,8 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
     break;
   }
 
-  if (t->is_dying()) {
-    LOG(debug) << "Task is dying, no status result";
-    return -ESRCH;
-  } else {
-    LOG(debug) << "done, result=" << t->regs().syscall_result();
-    return t->regs().syscall_result();
-  }
+  LOG(debug) << "done, result=" << t->regs().syscall_result();
+  return t->regs().syscall_result();
 }
 
 SupportedArch AutoRemoteSyscalls::arch() const { return t->arch(); }
@@ -496,7 +549,7 @@ struct fd_message {
   }
   remote_ptr<int> remote_cmsgdata() {
     return REMOTE_PTR_FIELD(remote_this(), cmsgbuf).as_int() +
-      (uintptr_t)Arch::cmsg_data(NULL);
+      sizeof(typename Arch::cmsghdr);
   }
 };
 
@@ -551,8 +604,8 @@ static long child_recvmsg(AutoRemoteSyscalls& remote, int child_sock) {
     sizeof(msg), &msg, &ok);
 
   if (!ok) {
-    ASSERT(remote.task(), errno == ESRCH) << "Error writing " << remote_buf.get()
-        << " in " << remote.task()->tid;
+    ASSERT(remote.task(), errno == ESRCH || errno == EIO)
+        << "Error writing " << remote_buf.get() << " in " << remote.task()->tid;
     LOG(debug) << "Failed to write memory";
     return -ESRCH;
   }
@@ -566,9 +619,34 @@ static long child_recvmsg(AutoRemoteSyscalls& remote, int child_sock) {
     LOG(debug) << "Failed to recvmsg " << ret;
     return ret;
   }
+
+  typename Arch::msghdr msghdr =
+      remote.task()->read_mem(msg.remote_msg(), &ok);
+  if (!ok) {
+    ASSERT(remote.task(), errno == ESRCH || errno == EIO);
+    LOG(debug) << "Failed to read msghdr";
+    return -ESRCH;
+  }
+  ASSERT(remote.task(), !(msghdr.msg_flags & MSG_CTRUNC))
+      << "Control message was truncated; error in receiving fd in "
+         "AutoRemoteSyscalls::child_recvmsg(). msghdr.msg_flags: "
+      << HEX(msghdr.msg_flags) << "\n"
+      << "This error has been most likely caused by a process\n"
+      << "exceeding the max allowed open files limit set by\n"
+      << "Linux. Please consult `man 1 ulimit' and `man 1 prlimit' to\n"
+      << "learn how the max open files limit may be changed/checked.\n"
+      << "As usual, always carefully think through all implications of\n"
+      << "changing the process limits on your programs before making any\n"
+      << "changes.\n\n"
+      << "If the above Assertion still fails, then (a) The limit you set was\n"
+      << "not high enough, or (b) the program could be opening files in an\n"
+      << "unbounded fashion, or (c) there is some other reason why socket\n"
+      << "control messages are being truncated and file descriptors cannot be\n"
+      << "received via SCM_RIGHTS.";
+
   int their_fd = remote.task()->read_mem(msg.remote_cmsgdata(), &ok);
   if (!ok) {
-    ASSERT(remote.task(), errno == ESRCH);
+    ASSERT(remote.task(), errno == ESRCH || errno == EIO);
     LOG(debug) << "Failed to read msg";
     return -ESRCH;
   }
@@ -632,7 +710,7 @@ static void sendmsg_socket(ScopedFd& sock, int fd_to_send)
 
 static Task* thread_group_leader_for_fds(Task* t) {
   for (Task* tt : t->fd_table()->task_set()) {
-    if (tt->tgid() == tt->rec_tid) {
+    if (tt->tgid() == tt->rec_tid && !tt->seen_ptrace_exit_event()) {
       return tt;
     }
   }
@@ -641,8 +719,9 @@ static Task* thread_group_leader_for_fds(Task* t) {
 
 template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
   ScopedFd ret;
-  // Try to use pidfd_getfd to get the fd without round-tripping to the tracee
   if (!pid_fd.is_open()) {
+    // Try to use pidfd_getfd to get the fd without round-tripping to the tracee.
+    // pidfd_getfd requires a threadgroup leader, so find one if we can.
     Task* tg_leader_for_fds = thread_group_leader_for_fds(t);
     if (tg_leader_for_fds) {
       pid_fd = ScopedFd(::syscall(NativeArch::pidfd_open, tg_leader_for_fds->tid, 0));
@@ -653,6 +732,10 @@ template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
   if (pid_fd.is_open()) {
     ret = ScopedFd(::syscall(NativeArch::pidfd_getfd, pid_fd.get(), fd, 0));
     if (ret.is_open()) {
+      return ret;
+    }
+    if (errno == EBADF) {
+      // This can happen when the child was unexpectedly killed.
       return ret;
     }
     ASSERT(t, errno == ENOSYS) << "Failed in pidfd_getfd errno=" << errno_name(errno);
@@ -744,10 +827,38 @@ remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall_if_alive(
           : infallible_syscall_ptr_if_alive(syscall_number_for_mmap(arch()), addr,
                                             length, prot, flags, child_fd,
                                             offset_bytes);
-  if (ret && (flags & MAP_FIXED)) {
-    ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
+  if (flags & MAP_FIXED) {
+    if (ret) {
+      ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
+    } else {
+      if (!t->vm()->has_mapping(addr)) {
+        KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
+        if (km.size()) {
+          ASSERT(t, km.start() == addr && km.size() == ceil_page_size(length));
+          // The mapping was created. Pretend this call succeeded.
+          ret = addr;
+        }
+      }
+    }
   }
   return ret;
+}
+
+bool AutoRemoteSyscalls::infallible_munmap_syscall_if_alive(
+    remote_ptr<void> addr, size_t length) {
+  long ret = infallible_syscall_if_alive(syscall_number_for_munmap(arch()),
+                                         addr, length);
+  if (ret) {
+    if (t->vm()->has_mapping(addr)) {
+      KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
+      if (!km.size()) {
+        // The unmap happened but the task must have died before
+        // reporting the status.
+        ret = 0;
+      }
+    }
+  }
+  return !ret;
 }
 
 int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
@@ -769,20 +880,23 @@ int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
   }
 }
 
-void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allow_death) {
+bool AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allow_death) {
   if (word_size(t->arch()) == 4) {
     // Sign-extend ret because it can be a 32-bit negative errno
     ret = (int)ret;
   }
   if (ret == -ESRCH && allow_death && !t->session().is_replaying()) {
-    return;
+    return true;
   }
   if (-4096 < ret && ret < 0) {
     string extra_msg;
     if (is_open_syscall(syscallno, arch())) {
       extra_msg = " opening " + t->read_c_str(t->regs().arg1());
-    } else if (is_openat_syscall(syscallno, arch())) {
+    } else if (is_openat_syscall(syscallno, arch()) || is_openat2_syscall(syscallno, arch())) {
       extra_msg = " opening " + t->read_c_str(t->regs().arg2());
+    } else if (is_mremap_syscall(syscallno, arch()) ||
+               is_mmap_syscall(syscallno, arch())) {
+      AddressSpace::print_process_maps(t);
     }
     ASSERT(t, false) << "Syscall " << syscall_name(syscallno, arch())
                      << " failed with errno " << errno_name(-ret) << extra_msg
@@ -790,6 +904,7 @@ void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allo
                      << " arg3=0x" << hex << t->regs().arg3() << " arg4=0x" << t->regs().arg4()
                      << " arg5=0x" << hex << t->regs().arg5() << " arg6=0x" << t->regs().arg6();
   }
+  return false;
 }
 
 void AutoRemoteSyscalls::finish_direct_mmap(
@@ -811,6 +926,9 @@ void AutoRemoteSyscalls::finish_direct_mmap(
    * recording. */
   {
     AutoRestoreMem child_str(*this, backing_file_name.c_str());
+    if (word_size(t->arch()) == 4) {
+      backing_file_open_flags |= RR_LARGEFILE_32;
+    }
     fd = infallible_syscall(syscall_number_for_openat(arch()), -1,
                             child_str.get().as_int(),
                             backing_file_open_flags);

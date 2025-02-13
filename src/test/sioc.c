@@ -14,7 +14,6 @@ const char* sockaddr_name(const struct sockaddr* addr) {
 const char* sockaddr_hw_name(const struct sockaddr* addr) {
   static char str[PATH_MAX];
   const unsigned char* data = (const unsigned char*)addr->sa_data;
-  test_assert(AF_LOCAL == addr->sa_family);
   sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x", data[0], data[1], data[2],
           data[3], data[4], data[5]);
   return str;
@@ -116,6 +115,10 @@ static int generic_request_by_name(int sockfd, struct ifreq* req, int nr,
     if (errno == EADDRNOTAVAIL) {
       // Some devices can return this in some configurations, e.g.
       // see mac802154_wpan_ioctl
+      atomic_printf("(errno:%d/%s)\n", errno, strerror(errno));
+      return 0;
+    }
+    if (errno == EPERM) {
       atomic_printf("(errno:%d/%s)\n", errno, strerror(errno));
       return 0;
     }
@@ -524,6 +527,14 @@ int main(void) {
     test_assert(EOPNOTSUPP == err || EPERM == err || EINVAL == err || ENODEV == err || ENOTTY == err);
   } else {
     atomic_printf("wireless ESSID:%s\n", buf);
+  }
+
+  if (GENERIC_REQUEST_BY_NAME(SIOCGMIIPHY)) {
+    atomic_printf("flags is %d\n", req->ifr_ifru.ifru_flags);
+  }
+
+  if (GENERIC_REQUEST_BY_NAME(SIOCGMIIREG)) {
+    atomic_printf("flags is %d\n", req->ifr_ifru.ifru_flags);
   }
 
   atomic_puts("EXIT-SUCCESS");

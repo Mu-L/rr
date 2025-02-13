@@ -71,7 +71,11 @@ public:
       bool use_audit = false,
       bool unmap_vdso = false,
       bool force_asan_active = false,
-      bool force_tsan_active = false);
+      bool force_tsan_active = false,
+      bool intel_pt = false,
+      bool check_outside_mmaps = false);
+
+  ~RecordSession() override;
 
   const DisableCPUIDFeatures& disable_cpuid_features() const {
     return disable_cpuid_features_;
@@ -95,6 +99,7 @@ public:
   }
   bool use_audit() const { return use_audit_; }
   bool unmap_vdso() { return unmap_vdso_; }
+  bool check_outside_mmaps() { return check_outside_mmaps_; }
   uint64_t rr_signal_mask() const;
 
   enum RecordStatus {
@@ -139,8 +144,6 @@ public:
   virtual RecordSession* as_record() override { return this; }
 
   TraceWriter& trace_writer() { return trace_out; }
-
-  virtual void on_destroy(Task* t) override;
 
   Scheduler& scheduler() { return scheduler_; }
 
@@ -206,6 +209,8 @@ public:
    */
   void forward_SIGTERM();
 
+  void on_destroy_record_task(RecordTask* t);
+
 private:
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
@@ -217,7 +222,9 @@ private:
                 const std::string& output_trace_dir,
                 const TraceUuid* trace_id,
                 bool use_audit,
-                bool unmap_vdso);
+                bool unmap_vdso,
+                bool intel_pt,
+                bool check_outside_mmaps);
 
   virtual void on_create(Task* t) override;
 
@@ -230,6 +237,10 @@ private:
                              RecordResult* step_result,
                              SupportedArch syscall_arch);
   void check_initial_task_syscalls(RecordTask* t, RecordResult* step_result);
+  void handle_seccomp_trap(RecordTask* t, StepState* step_state,
+                           uint16_t seccomp_data);
+  void handle_seccomp_errno(RecordTask* t, StepState* step_state,
+                            uint16_t seccomp_data);
   bool handle_ptrace_event(RecordTask** t_ptr, StepState* step_state,
                            RecordResult* result, bool* did_enter_syscall);
   bool handle_signal_event(RecordTask* t, StepState* step_state);
@@ -278,6 +289,7 @@ private:
 
   bool use_audit_;
   bool unmap_vdso_;
+  bool check_outside_mmaps_;
 };
 
 } // namespace rr

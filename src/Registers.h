@@ -10,7 +10,7 @@
 #include <string.h>
 #include <sys/user.h>
 
-#include "GdbRegister.h"
+#include "GdbServerRegister.h"
 #include "core.h"
 #include "kernel_abi.h"
 #include "remote_code_ptr.h"
@@ -22,12 +22,6 @@ namespace rr {
 
 class ReplayTask;
 
-enum MismatchBehavior {
-  EXPECT_MISMATCHES = 0,
-  LOG_MISMATCHES,
-  BAIL_ON_MISMATCH
-};
-
 const uintptr_t X86_RESERVED_FLAG = 1 << 1;
 const uintptr_t X86_ZF_FLAG = 1 << 6;
 const uintptr_t X86_TF_FLAG = 1 << 8;
@@ -37,6 +31,7 @@ const uintptr_t X86_RF_FLAG = 1 << 16;
 const uintptr_t X86_ID_FLAG = 1 << 21;
 
 const uintptr_t AARCH64_DBG_SPSR_SS = 1 << 21;
+const uintptr_t AARCH64_DBG_SPSR_11 = 1 << 11;
 
 /**
  * A Registers object contains values for all general-purpose registers.
@@ -60,7 +55,7 @@ class Registers {
 public:
   enum { MAX_SIZE = 16 };
 
-  Registers(SupportedArch a = SupportedArch(-1)) : arch_(a) {
+  Registers(SupportedArch a = x86) : arch_(a) {
     memset(&u, 0, sizeof(u));
   }
 
@@ -409,34 +404,14 @@ public:
     u.arm64regs.pstate = pstate;
   }
 
-  void set_x7(uintptr_t x7) {
-    DEBUG_ASSERT(arch() == aarch64);
-    u.arm64regs.x[7] = x7;
+  void set_x(unsigned regno, uintptr_t val) {
+    DEBUG_ASSERT(arch() == aarch64 && regno < 31);
+    u.arm64regs.x[regno] = val;
   }
 
-  void set_x15(uintptr_t x15) {
-    DEBUG_ASSERT(arch() == aarch64);
-    u.arm64regs.x[15] = x15;
-  }
-
-  void set_xlr(uintptr_t xlr) {
-    DEBUG_ASSERT(arch() == aarch64);
-    u.arm64regs.x[30] = xlr;
-  }
-
-  uintptr_t x1() const {
-    DEBUG_ASSERT(arch() == aarch64);
-    return u.arm64regs.x[1];
-  }
-
-  uintptr_t x7() const {
-    DEBUG_ASSERT(arch() == aarch64);
-    return u.arm64regs.x[7];
-  }
-
-  uintptr_t xlr() const {
-    DEBUG_ASSERT(arch() == aarch64);
-    return u.arm64regs.x[30];
+  uintptr_t x(unsigned regno) const {
+    DEBUG_ASSERT(arch() == aarch64 && regno < 31);
+    return u.arm64regs.x[regno];
   }
   // End of aarch64 specific accessors
 
@@ -468,26 +443,37 @@ public:
   void print_register_file_compact(FILE* f) const;
   void print_register_file_for_trace_raw(FILE* f) const;
 
-  /**
-   * Return true if |reg1| matches |reg2|.  Passing EXPECT_MISMATCHES
-   * indicates that the caller is using this as a general register
-   * compare and nothing special should be done if the register files
-   * mismatch.  Passing LOG_MISMATCHES will log the registers that don't
-   * match.  Passing BAIL_ON_MISMATCH will additionally abort on
-   * mismatch.
-   */
-  static bool compare_register_files(ReplayTask* t, const char* name1,
-                                     const Registers& reg1, const char* name2,
-                                     const Registers& reg2,
-                                     MismatchBehavior mismatch_behavior);
+  struct Mismatch {
+    std::string register_name;
+    std::string val1;
+    std::string val2;
+  };
+  struct Comparison {
+    std::vector<Mismatch> mismatches;
+    int mismatch_count = 0;
+    bool store_mismatches = true;
 
-  bool matches(const Registers& other) const {
-    return compare_register_files(nullptr, nullptr, *this, nullptr, other,
-                                  EXPECT_MISMATCHES);
+    void add_mismatch(const char* reg_name, uint64_t val1, uint64_t val2);
+  };
+
+  // This is cheap when there are no mismatches. It can be a bit expensive
+  // (allocation) when mismatches are expected; call matches() instead in
+  // that case, which doesn't allocate.
+  Comparison compare_with(const Registers& other) const {
+    Comparison result;
+    compare_internal(other, result);
+    return result;
   }
 
-  // TODO: refactor me to use the GdbRegisterValue helper from
-  // GdbConnection.h.
+  bool matches(const Registers& other) const {
+    Comparison result;
+    result.store_mismatches = false;
+    compare_internal(other, result);
+    return !result.mismatch_count;
+  }
+
+  // TODO: refactor me to use the GdbServerRegisterValue helper from
+  // GdbServerConnection.h.
 
   /**
    * Write the value for register |regno| into |buf|, which should
@@ -495,7 +481,7 @@ public:
    * Return the size of the register in bytes and set |defined| to
    * indicate whether a useful value has been written to |buf|.
    */
-  size_t read_register(uint8_t* buf, GdbRegister regno, bool* defined) const;
+  size_t read_register(uint8_t* buf, GdbServerRegister regno, bool* defined) const;
 
   /**
    * Write the value for register |offset| into |buf|, which should
@@ -511,7 +497,7 @@ public:
    * Update the register named |reg_name| to |value| with
    * |value_size| number of bytes.
    */
-  bool write_register(GdbRegister reg_name, const void* value,
+  bool write_register(GdbServerRegister reg_name, const void* value,
                       size_t value_size);
 
   /**
@@ -542,6 +528,8 @@ public:
     return !(*this == other);
   }
 
+  void emulate_syscall_entry();
+
 private:
   template <typename Arch>
   void print_register_file_arch(FILE* f, const char* formats[]) const;
@@ -556,21 +544,19 @@ private:
                                           const char* formats[]) const;
 
   template <typename Arch>
-  static bool compare_registers_core(const char* name1, const Registers& reg1,
-                                     const char* name2, const Registers& reg2,
-                                     MismatchBehavior mismatch_behavior);
+  static void compare_registers_core(const Registers& reg1,
+                                     const Registers& reg2,
+                                     Comparison& result);
 
   template <typename Arch>
-  static bool compare_registers_arch(const char* name1, const Registers& reg1,
-                                     const char* name2, const Registers& reg2,
-                                     MismatchBehavior mismatch_behavior);
+  static void compare_registers_arch(const Registers& reg1,
+                                     const Registers& reg2,
+                                     Comparison& result);
 
-  static bool compare_register_files_internal(
-      const char* name1, const Registers& reg1, const char* name2,
-      const Registers& reg2, MismatchBehavior mismatch_behavior);
+  void compare_internal(const Registers& other, Comparison& result) const;
 
   template <typename Arch>
-  size_t read_register_arch(uint8_t* buf, GdbRegister regno,
+  size_t read_register_arch(uint8_t* buf, GdbServerRegister regno,
                             bool* defined) const;
 
   template <typename Arch>
@@ -578,7 +564,7 @@ private:
                                            bool* defined) const;
 
   template <typename Arch>
-  bool write_register_arch(GdbRegister regno, const void* value,
+  bool write_register_arch(GdbServerRegister regno, const void* value,
                            size_t value_size);
 
   template <typename Arch>
@@ -625,6 +611,8 @@ ret with_converted_registers(const Registers& regs, SupportedArch arch,
 }
 
 std::ostream& operator<<(std::ostream& stream, const Registers& r);
+
+std::ostream& operator<<(std::ostream& stream, const Registers::Comparison& c);
 
 } // namespace rr
 

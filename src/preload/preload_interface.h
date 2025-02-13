@@ -145,6 +145,8 @@ static inline const char* extract_file_name(const char* s) {
 /* Not ABI stable - in record page only */
 #define RR_PAGE_FF_BYTES RR_PAGE_BREAKPOINT_VALUE
 
+#define RR_DL_RUNTIME_RESOLVE_CLEAR_FIP (RR_PAGE_ADDR - PRELOAD_LIBRARY_PAGE_SIZE)
+
 /* PRELOAD_THREAD_LOCALS_ADDR should not change.
  * Tools depend on this address. */
 #define PRELOAD_THREAD_LOCALS_ADDR (RR_PAGE_ADDR + PRELOAD_LIBRARY_PAGE_SIZE)
@@ -183,6 +185,11 @@ static inline const char* extract_file_name(const char* s) {
  * (rather than the first), which requires special handling.
  */
 #define PATCH_SYSCALL_INSTRUCTION_IS_LAST (1 << 1)
+/* All instructions in the patch are nop and their execution is thus not
+ * observable. This may allow more aggressive handling of interfering branches.
+ */
+#define PATCH_IS_NOP_INSTRUCTIONS (1 << 2)
+
 
 /**
  * To support syscall buffering, we replace syscall instructions with a "call"
@@ -221,6 +228,11 @@ struct mprotect_record {
   uint64_t size;
   int32_t prot;
   int32_t padding;
+};
+
+enum ContextSwitchEventStrategy {
+  STRATEGY_SW_CONTEXT_SWITCHES,
+  STRATEGY_RECORD_SWITCH
 };
 
 /**
@@ -264,7 +276,13 @@ struct preload_globals {
    * syscallbuf_fd_class[SYSCALLBUF_FDS_DISABLED_SIZE - 1]. See the
    */
   VOLATILE char syscallbuf_fd_class[SYSCALLBUF_FDS_DISABLED_SIZE];
-  /* mprotect records. Set by preload. */
+
+  /* WARNING! SYSCALLBUF_FDS_DISABLED_SIZE can change, so
+     access to the following fields during replay is dangerous. Use
+     PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED or something
+     like it! */
+  /* mprotect records. Set by preload. Use
+     PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED to access. */
   struct mprotect_record mprotect_records[MPROTECT_RECORD_COUNT];
   /* Random seed that can be used for various purposes. DO NOT READ from rr
      during replay, because this field does not exist in old traces. */
@@ -274,14 +292,18 @@ struct preload_globals {
    * QUIRK: With UsesGlobalsInReplayQuirk:
    * Indicates the value (in 8-byte increments) at which to raise a SIGSEGV
    * trap once reached. NOTE: This remains constant during record, and is
-   * used only during replay. The same restrictions as in_replay above apply */
+   * used only during replay. The same restrictions as in_replay above apply.
+   *
+   * Use PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED to access during
+   * replay. */
   uint64_t reserved_legacy_breakpoint_value;
   /* Indicates whether or not all tasks in this address space have the same
      fd table. Set by rr during record (modifications are recorded).
-     Read by the syscallbuf */
+     Read by the syscallbuf. Not read during replay. */
   unsigned char fdt_uniform;
-  /* The CPU we're bound to, if any; -1 if not bound. */
+  /* The CPU we're bound to, if any; -1 if not bound. Not read during replay. */
   int32_t cpu_binding;
+  enum ContextSwitchEventStrategy context_switch_event_strategy;
 };
 
 /**
@@ -605,10 +627,12 @@ struct syscallbuf_hdr {
    * anything. This is set when a user seccomp filter forces a SIGSYS. */
   volatile uint8_t failed_during_preparation;
 
-  struct syscallbuf_record recs[0];
+  uint8_t padding[2];
 } __attribute__((__packed__));
-/* TODO: static_assert(sizeof(uint32_t) ==
- *                     sizeof(struct syscallbuf_hdr)) */
+#ifdef __cplusplus
+static_assert(sizeof(struct syscallbuf_hdr) % 8 == 0,
+              "syscallbuf_hdr size must be multiple of 8");
+#endif
 
 /**
  * Each bit of of syscallbuf_hdr->locked indicates a reason why the syscallbuf
@@ -621,17 +645,6 @@ enum syscallbuf_locked_why {
      semantics (e.g. for ptracees whose syscalls are being observed) */
   SYSCALLBUF_LOCKED_TRACER = 0x2
 };
-
-/**
- * Return a pointer to what may be the next syscall record.
- *
- * THIS POINTER IS NOT GUARANTEED TO BE VALID!!!  Caveat emptor.
- */
-inline static struct syscallbuf_record* next_record(
-    struct syscallbuf_hdr* hdr) {
-  uintptr_t next = (uintptr_t)hdr->recs + hdr->num_rec_bytes;
-  return (struct syscallbuf_record*)next;
-}
 
 /**
  * Return the amount of space that a record of |length| will occupy in

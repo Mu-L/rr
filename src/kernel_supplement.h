@@ -3,9 +3,12 @@
 #ifndef RR_KERNEL_SUPPLEMENT_H_
 #define RR_KERNEL_SUPPLEMENT_H_
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
+#endif
 
 #include <linux/capability.h>
+#include <linux/dma-buf.h>
 #include <linux/if_tun.h>
 #include <linux/mman.h>
 #include <linux/seccomp.h>
@@ -79,6 +82,7 @@ enum _ptrace_options {
   KERNEL_CONSTANT(PTRACE_O_TRACEVFORK),
   KERNEL_CONSTANT(PTRACE_O_TRACECLONE),
   KERNEL_CONSTANT(PTRACE_O_TRACEEXEC),
+  KERNEL_CONSTANT(PTRACE_O_TRACEVFORKDONE),
   KERNEL_CONSTANT(PTRACE_O_TRACEEXIT),
   KERNEL_CONSTANT(PTRACE_O_TRACESECCOMP),
   KERNEL_CONSTANT(PTRACE_O_EXITKILL),
@@ -113,6 +117,10 @@ enum _ptrace_get_syscall_info_op {
 #define SYS_SECCOMP 1
 #endif
 
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
+
 #ifndef PR_GET_SPECULATION_CTRL
 #define PR_GET_SPECULATION_CTRL 52
 #endif
@@ -130,6 +138,14 @@ enum _ptrace_get_syscall_info_op {
 // This is used on AArch64 and not available on CentOS 7.8
 #ifndef NT_ARM_SYSTEM_CALL
 #define NT_ARM_SYSTEM_CALL 0x404
+#endif
+
+#ifndef NT_ARM_PACA_KEYS
+#define NT_ARM_PACA_KEYS 0x407
+#endif
+
+#ifndef NT_ARM_PACG_KEYS
+#define NT_ARM_PACG_KEYS 0x408
 #endif
 
 // These are defined by the include/linux/errno.h in the kernel tree.
@@ -247,6 +263,24 @@ struct rr_input_mask {
 #ifndef MADV_SOFT_OFFLINE
 #define MADV_SOFT_OFFLINE 101
 #endif
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_DONTNEED_LOCKED
+#define MADV_DONTNEED_LOCKED 24
+#endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 
 #ifndef BUS_MCEERR_AR
 #define BUS_MCEERR_AR 4
@@ -258,8 +292,11 @@ struct rr_input_mask {
 
 // Defined in the ip_tables header for each protocol, but always to the same,
 // value, so it should be fine to set this here
-#ifndef SO_SET_REPLACE
-#define SO_SET_REPLACE 64
+#ifndef IPT_SO_SET_REPLACE
+#define IPT_SO_SET_REPLACE 64
+#endif
+#ifndef IPV6T_SO_SET_REPLACE
+#define IPV6T_SO_SET_REPLACE 64
 #endif
 
 #ifndef HCIGETDEVLIST
@@ -391,44 +428,48 @@ struct rr_input_mask {
 #ifndef MAP_SYNC
 #define MAP_SYNC  0x80000
 #endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 enum {
-  BPF_MAP_CREATE,
-  BPF_MAP_LOOKUP_ELEM,
-  BPF_MAP_UPDATE_ELEM,
-  BPF_MAP_DELETE_ELEM,
-  BPF_MAP_GET_NEXT_KEY,
-  BPF_PROG_LOAD,
-  BPF_OBJ_PIN,
-  BPF_OBJ_GET,
-  BPF_PROG_ATTACH,
-  BPF_PROG_DETACH,
-  BPF_PROG_TEST_RUN,
-  BPF_PROG_GET_NEXT_ID,
-  BPF_MAP_GET_NEXT_ID,
-  BPF_PROG_GET_FD_BY_ID,
-  BPF_MAP_GET_FD_BY_ID,
-  BPF_OBJ_GET_INFO_BY_FD,
-  BPF_PROG_QUERY,
-  BPF_RAW_TRACEPOINT_OPEN,
-  BPF_BTF_LOAD,
-  BPF_BTF_GET_FD_BY_ID,
-  BPF_TASK_FD_QUERY,
-  BPF_MAP_LOOKUP_AND_DELETE_ELEM,
-  BPF_MAP_FREEZE,
-  BPF_BTF_GET_NEXT_ID,
-  BPF_MAP_LOOKUP_BATCH,
-  BPF_MAP_LOOKUP_AND_DELETE_BATCH,
-  BPF_MAP_UPDATE_BATCH,
-  BPF_MAP_DELETE_BATCH,
-  BPF_LINK_CREATE,
-  BPF_LINK_UPDATE,
-  BPF_LINK_GET_FD_BY_ID,
-  BPF_LINK_GET_NEXT_ID,
-  BPF_ENABLE_STATS,
-  BPF_ITER_CREATE,
-  BPF_LINK_DETACH,
-  BPF_PROG_BIND_MAP,
+  RR_BPF_MAP_CREATE,
+  RR_BPF_MAP_LOOKUP_ELEM,
+  RR_BPF_MAP_UPDATE_ELEM,
+  RR_BPF_MAP_DELETE_ELEM,
+  RR_BPF_MAP_GET_NEXT_KEY,
+  RR_BPF_PROG_LOAD,
+  RR_BPF_OBJ_PIN,
+  RR_BPF_OBJ_GET,
+  RR_BPF_PROG_ATTACH,
+  RR_BPF_PROG_DETACH,
+  RR_BPF_PROG_TEST_RUN,
+  RR_BPF_PROG_GET_NEXT_ID,
+  RR_BPF_MAP_GET_NEXT_ID,
+  RR_BPF_PROG_GET_FD_BY_ID,
+  RR_BPF_MAP_GET_FD_BY_ID,
+  RR_BPF_OBJ_GET_INFO_BY_FD,
+  RR_BPF_PROG_QUERY,
+  RR_BPF_RAW_TRACEPOINT_OPEN,
+  RR_BPF_BTF_LOAD,
+  RR_BPF_BTF_GET_FD_BY_ID,
+  RR_BPF_TASK_FD_QUERY,
+  RR_BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+  RR_BPF_MAP_FREEZE,
+  RR_BPF_BTF_GET_NEXT_ID,
+  RR_BPF_MAP_LOOKUP_BATCH,
+  RR_BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+  RR_BPF_MAP_UPDATE_BATCH,
+  RR_BPF_MAP_DELETE_BATCH,
+  RR_BPF_LINK_CREATE,
+  RR_BPF_LINK_UPDATE,
+  RR_BPF_LINK_GET_FD_BY_ID,
+  RR_BPF_LINK_GET_NEXT_ID,
+  RR_BPF_ENABLE_STATS,
+  RR_BPF_ITER_CREATE,
+  RR_BPF_LINK_DETACH,
+  RR_BPF_PROG_BIND_MAP,
+  RR_BPF_TOKEN_CREATE,
 };
 
 #ifndef O_PATH
@@ -465,9 +506,25 @@ enum {
 #define RR_RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT 2
 #define RR_RSEQ_CPU_ID_UNINITIALIZED -1
 
+// New in the 5.5 kernel
+#ifndef BLKOPENZONE
+#define BLKOPENZONE _IOW(0x12, 134, struct blk_zone_range)
+#endif
+#ifndef BLKCLOSEZONE
+#define BLKCLOSEZONE _IOW(0x12, 135, struct blk_zone_range)
+#endif
+#ifndef BLKFINISHZONE
+#define BLKFINISHZONE _IOW(0x12, 136, struct blk_zone_range)
+#endif
+
 // New in the 5.7 kernel
 #ifndef MREMAP_DONTUNMAP
 #define MREMAP_DONTUNMAP 4
+#endif
+
+// New in the 5.13 kernel
+#ifndef OTPERASE
+#define OTPERASE _IOW('M', 25, struct otp_info)
 #endif
 
 // New in the 5.15 kernel
@@ -483,6 +540,11 @@ enum {
 #define PR_SET_VMA_ANON_NAME 0
 #endif
 
+// New in the 6.1 kernel
+#ifndef MEMREAD
+#define MEMREAD _IOWR('M', 26, typename Arch::mtd_read_req)
+#endif
+
 // Technically not "kernel" constants, exactly, since these are defined
 // in libc, but required for compat with older libcs like the rest of
 // this file.
@@ -492,6 +554,31 @@ enum {
 
 #ifndef ELFCOMPRESS_ZLIB
 #define ELFCOMPRESS_ZLIB 1
+#endif
+#ifndef ELFCOMPRESS_ZSTD
+#define ELFCOMPRESS_ZSTD 2
+#endif
+
+// O_LARGEFILE is defined to 0 for 64-bit builds. We need to know the
+// value that is used for 32-bit processes.
+#define RR_LARGEFILE_32 0x8000
+
+#ifndef ARCH_GET_XCOMP_SUPP
+#define ARCH_GET_XCOMP_SUPP 0x1021
+#endif
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+
+#ifndef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
+struct dma_buf_export_sync_file {
+  uint32_t flags;
+  int32_t fd;
+};
 #endif
 
 } // namespace rr

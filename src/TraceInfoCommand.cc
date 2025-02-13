@@ -97,6 +97,23 @@ static int dump_trace_info(const string& trace_dir, FILE* out) {
     }
   }
 
+  uint8_t max_virtual_address_size = trace.max_virtual_address_size();
+  if (max_virtual_address_size > 0) {
+    fprintf(out, "  \"maxVirtualAddressSize\":%d,\n", max_virtual_address_size);
+  }
+
+  if (!trace.uname().sysname.empty()) {
+    const auto& uname = trace.uname();
+    fputs("  \"uname\":{", out);
+    fprintf(out, "\n    \"sysname\":\"%s\",", json_escape(uname.sysname).c_str());
+    fprintf(out, "\n    \"nodename\":\"%s\",", json_escape(uname.nodename).c_str());
+    fprintf(out, "\n    \"release\":\"%s\",", json_escape(uname.release).c_str());
+    fprintf(out, "\n    \"version\":\"%s\",", json_escape(uname.version).c_str());
+    fprintf(out, "\n    \"machine\":\"%s\",", json_escape(uname.machine).c_str());
+    fprintf(out, "\n    \"domainname\":\"%s\"", json_escape(uname.domainname).c_str());
+    fputs("\n  },\n", out);
+  }
+
   ReplaySession::Flags flags;
   flags.redirect_stdio = false;
   flags.share_private_mappings = false;

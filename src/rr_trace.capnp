@@ -52,6 +52,15 @@ enum ChaosMode {
   knownFalse @2;
 }
 
+struct UtsName {
+  sysname @0 :CString;
+  nodename @1 :CString;
+  release @2 :CString;
+  version @3 :CString;
+  machine @4 :CString;
+  domainname @5 :CString;
+}
+
 # The 'version' file contains an ASCII version number followed by a newline.
 # The version number is currently 85 and increments only when there's a
 # backwards-incompatible change. See TRACE_VERSION.
@@ -131,7 +140,18 @@ struct Header {
   # rr page size, i.e. the one used to build the librr_page.so
   preloadLibraryPageSize @23 :UInt32 = 4096;
   # SYSCALLBUF_FDS_DISABLED_SIZE during recording
-  syscallbufFdsDisabledSize @25 : UInt32 = 1024;
+  syscallbufFdsDisabledSize @25 :UInt32 = 1024;
+  # sizeof(syscallbuf_hdr) during recording
+  syscallbufHdrSize @26 :UInt32 = 30;
+  # Result of uname(2). Possibly useful for diagnostics or LLDB qHostInfo.
+  uname @27 :UtsName;
+  # The highest virtual address size (in bits) needed to replay this trace. Some
+  # platforms (e.g. x86-64) have multiple possible virtual address sizes, and
+  # trace portability requires that traces that require a higher virtual address
+  # size are not replayed on systems that only support a lower virtual address
+  # size. A value of 0, only present for traces recorded before this was added,
+  # means the default value for the relevant arch.
+  maxVirtualAddressSize @28 :UInt8 = 0;
 }
 
 # A file descriptor belonging to a task
@@ -205,6 +225,7 @@ struct TaskEvent {
       interpBase @10 :RemotePtr;
       # Not a Path since it is only meaningful during recording
       interpName @11 :CString;
+      pacData @12 :PACData;
     }
     # Most frame 'exit' events generate one of these, but these are not
     # generated if rr ends abnormally so the tasks did not in fact exit during
@@ -230,6 +251,10 @@ struct MemWrite {
   # A list of regions where zeroes are written. These are not
   # present in the compressed data.
   holes @3 :List(WriteHole);
+  # This is set for writes where we don't actually know that the write
+  # will apply in full in the replayee (e.g. for conservative sigframe
+  # captures when handling EV_SIGNAL).
+  sizeIsConservative @4 :Bool;
 }
 
 enum Arch {
@@ -245,6 +270,11 @@ struct Registers {
 
 struct ExtraRegisters {
   # May be empty. Format determined by Frame::arch
+  raw @0 :Data;
+}
+
+struct PACData {
+  # Formay determined by Frame::arch
   raw @0 :Data;
 }
 
@@ -281,6 +311,11 @@ struct OpenedFd {
   # May be zero for legacy recordings!
   device @2 :Device;
   inode @3 :Inode;
+}
+
+struct MemRange {
+  start @0 :RemotePtr;
+  end @1 :RemotePtr;
 }
 
 # The 'events' file is a sequence of these.
@@ -339,6 +374,14 @@ struct Frame {
           localAddr @28 :Data;
           remoteAddr @29 :Data;
         }
+        # The list of all memory ranges affected by an madvise(). If empty,
+        # a successful madvise affected the range indicated by its parameters,
+        # and an unsuccessful madvise affected nothing.
+        # Currently, if an madvise was fully successful (returned 0),
+        # this list is always empty.
+        # Only populated for replay-relevant madvises, i.e. DONTNEED(_LOCKED)
+        # and REMOVE.
+        madviseRanges @32 :List(MemRange);
       }
     }
     patchAfterSyscall @26: Void;

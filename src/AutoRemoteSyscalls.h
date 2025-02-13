@@ -188,11 +188,27 @@ public:
   /**
    * Remote mmap syscalls are common and non-trivial due to the need to
    * select either mmap2 or mmap.
-   * Returns null if the process dies or has died.
+   * Returns null if the process died (or was already dead) without
+   * creating the map. "Dead" includes reaching PTRACE_EVENT_EXIT.
+   * If the mapping is FIXED and no mapping currently exists at the address,
+   * and the syscall creates the mapping but the process dies before returning
+   * success, we fix the result to indicate that the syscall succeeded.
+   * Creating FIXED mappings in areas free according to AddressSpace is the only
+   * reliable way to keep AddressSpace in sync with reality in the event of
+   * unexpected process death racing with this operation.
    */
   remote_ptr<void> infallible_mmap_syscall_if_alive(remote_ptr<void> addr, size_t length,
                                                     int prot, int flags, int child_fd,
                                                     uint64_t offset_bytes);
+
+  /**
+   * Returns false if the process died (or was already dead) without
+   * unmapping the area. "Dead" includes reaching PTRACE_EVENT_EXIT.
+   * If a mapping currently exists at the address, and the syscall unmaps
+   * the mapping but the process dies before returning success, we fix
+   * the result to indicate that the syscall succeeded.
+   */
+  bool infallible_munmap_syscall_if_alive(remote_ptr<void> addr, size_t length);
 
   /** TODO replace with infallible_lseek_syscall_if_alive */
   int64_t infallible_lseek_syscall(int fd, int64_t offset, int whence);
@@ -266,7 +282,8 @@ public:
                           struct stat& real_file, std::string& real_file_name);
 
   // Calling this with allow_death false is DEPRECATED.
-  void check_syscall_result(long ret, int syscallno, bool allow_death = true);
+  // Returns true iff session was not replaying and allow_death is true and process is not alive (-ESRCH)
+  bool check_syscall_result(long ret, int syscallno, bool allow_death = true);
 
 private:
   void setup_path(bool enable_singlestep_path);
@@ -313,6 +330,7 @@ private:
   sig_set_t sigmask_to_restore;
 
   bool need_sigpending_renable;
+  bool need_desched_event_reenable;
 
   AutoRemoteSyscalls& operator=(const AutoRemoteSyscalls&) = delete;
   AutoRemoteSyscalls(const AutoRemoteSyscalls&) = delete;

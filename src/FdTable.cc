@@ -128,12 +128,12 @@ void FdTable::did_write(Task* t, int fd,
   }
 }
 
-void FdTable::did_dup(int from, int to) {
-  if (fds.count(from)) {
+void FdTable::did_dup(FdTable* table, int from, int to) {
+  if (table->fds.count(from)) {
     if (to >= syscallbuf_fds_disabled_size && fds.count(to) == 0) {
       fd_count_beyond_limit++;
     }
-    fds[to] = fds[from];
+    fds[to] = table->fds[from];
   } else {
     if (to >= syscallbuf_fds_disabled_size && fds.count(to) > 0) {
       fd_count_beyond_limit--;
@@ -227,8 +227,8 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
     return;
   }
 
-  char disabled[syscallbuf_fds_disabled_size];
-  memset(disabled, 0, sizeof(disabled));
+  vector<char> disabled;
+  disabled.resize(syscallbuf_fds_disabled_size, 0);
 
   // It's possible that some tasks in this address space have a different
   // FdTable. We need to disable syscallbuf for an fd if any tasks for this
@@ -249,8 +249,8 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
   }
 
   auto addr = REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fd_class[0]);
-  rt->write_mem(addr, disabled, syscallbuf_fds_disabled_size);
-  rt->record_local(addr, disabled, syscallbuf_fds_disabled_size);
+  rt->write_mem(addr, disabled.data(), syscallbuf_fds_disabled_size);
+  rt->record_local(addr, disabled.data(), syscallbuf_fds_disabled_size);
 }
 
 void FdTable::close_after_exec(ReplayTask* t, const vector<int>& fds_to_close) {
