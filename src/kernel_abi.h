@@ -121,6 +121,7 @@ struct KernelConstants {
   static const int PTRACE_O_TRACEVFORK = 1 << PTRACE_EVENT_VFORK;
   static const int PTRACE_O_TRACECLONE = 1 << PTRACE_EVENT_CLONE;
   static const int PTRACE_O_TRACEEXEC = 1 << PTRACE_EVENT_EXEC;
+  static const int PTRACE_O_TRACEVFORKDONE = 1 << PTRACE_EVENT_VFORK_DONE;
   static const int PTRACE_O_TRACEEXIT = 1 << PTRACE_EVENT_EXIT;
   static const int PTRACE_O_TRACESECCOMP = 1 << PTRACE_EVENT_SECCOMP;
   static const int PTRACE_O_EXITKILL = 1 << 20;
@@ -290,6 +291,21 @@ struct WordSize32Defs {
     uint32_t n_type;
   } ElfNhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Nhdr, ElfNhdr);
+  typedef struct {
+    uint32_t r_offset;
+    uint32_t r_info;
+  } ElfRel;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Rel, ElfRel);
+  typedef struct {
+    uint32_t r_offset;
+    uint32_t r_info;
+    int32_t r_addend;
+  } ElfRela;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Rela, ElfRela);
+
+  static uint8_t clz_ptr(remote_ptr<void> ptr) {
+    return __builtin_clz(ptr.as_int());
+  }
 };
 
 struct WordSize64Defs {
@@ -386,6 +402,21 @@ struct WordSize64Defs {
     uint32_t n_type;
   } ElfNhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Nhdr, ElfNhdr);
+  typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+  } ElfRel;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Rel, ElfRel);
+  typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+    int64_t r_addend;
+  } ElfRela;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Rela, ElfRela);
+
+  static uint8_t clz_ptr(remote_ptr<void> ptr) {
+    return __builtin_clzl(ptr.as_int());
+  }
 };
 
 /**
@@ -671,6 +702,13 @@ struct BaseArch : public wordsize,
       struct {
         ptr<void> si_addr_;
         signed_short si_addr_lsb_;
+        union {
+          struct {
+            ptr<void> _lower;
+            ptr<void> _upper;
+          } _addr_bnds;
+          uint32_t _pkey;
+        } _bounds;
       } _sigfault;
       struct {
         signed_long si_band_;
@@ -1550,6 +1588,21 @@ struct BaseArch : public wordsize,
   // this check.
   // RR_VERIFY_TYPE(ipt_replace);
 
+  struct ip6t_replace {
+    uint8_t name[32];
+    uint32_t valid_hook;
+    uint32_t num_entries;
+    uint32_t size;
+    uint32_t hook_entry[5];
+    uint32_t underflow[5];
+    uint32_t num_counters;
+    ptr<xt_counters> counters; // ptr<xt_counters>
+    // Plus hangoff here
+  };
+  // The corresponding header requires -fpermissive, which we don't pass. Skip
+  // this check.
+  // RR_VERIFY_TYPE(ip6t_replace);
+
   struct cap_header {
     uint32_t version;
     int pid;
@@ -1752,7 +1805,7 @@ struct BaseArch : public wordsize,
       };
       __u64 flags;
     };
-    struct {
+    struct { /* used by BPF_PROG_LOAD */
       __u32 prog_type;
       __u32 insn_cnt;
       ptr64<void> insns;
@@ -1773,6 +1826,34 @@ struct BaseArch : public wordsize,
       aligned_u64 line_info;
       __u32 line_info_cnt;
     };
+
+    struct { /* anonymous struct used by BPF_PROG_QUERY command */
+      union {
+        __u32 target_fd; /* target object to query or ... */
+        __u32 target_ifindex; /* target ifindex */
+      };
+      __u32 attach_type;
+      __u32 query_flags;
+      __u32 attach_flags;
+      ptr64<__u32> prog_ids;
+      union {
+        __u32 prog_cnt;
+        __u32 count;
+      };
+      __u32 :32;
+      /* output: per-program attach_flags.
+       * not allowed to be set during effective query.
+       */
+      ptr64<__u32> prog_attach_flags;
+      ptr64<__u32> link_ids;
+      ptr64<__u32> link_attach_flags;
+      __u64 revision;
+    } query;
+    struct { /* anonymous struct used by RR_BPF_OBJ_GET_INFO_BY_FD command */
+      __u32 bpf_fd;
+      __u32 info_len;
+      __u64 info;
+    } info;
   };
 
   struct file_handle {
@@ -1925,6 +2006,24 @@ struct BaseArch : public wordsize,
   };
   RR_VERIFY_TYPE(cdrom_tocentry);
 
+  struct mtd_read_req_ecc_stats {
+    uint32_t uncorrectable_errors;
+    uint32_t corrected_bitflips;
+    uint32_t max_bitflips;
+  };
+
+  struct mtd_read_req {
+    uint64_t start;
+    uint64_t len;
+    uint64_t ooblen;
+    uint64_t usr_data;
+    uint64_t usr_oob;
+    uint8_t mode;
+    uint8_t padding[7];
+    struct mtd_read_req_ecc_stats ecc_stats;
+  };
+  // mtd_read_req was only added in kernel 6.1 so don't try to verify it yet.
+
   struct ptrace_syscall_info {
     uint8_t op;
     uint32_t arch;
@@ -1950,6 +2049,8 @@ struct BaseArch : public wordsize,
 
 struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   typedef X64Arch Arch64;
+
+  static const uint8_t default_virtual_address_size = 47;
 
   static const size_t elfmachine = EM::X86_64;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
@@ -2154,6 +2255,8 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
 
 struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   typedef X64Arch Arch64;
+
+  static const uint8_t default_virtual_address_size = 32;
 
   static const size_t elfmachine = EM::I386;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
@@ -2411,6 +2514,8 @@ struct GenericArch : public BaseArch<arch_, wordsize> {
 struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
   typedef ARM64Arch Arch64;
 
+  static const uint8_t default_virtual_address_size = 47;
+
   static const size_t elfmachine = EM::AARCH64;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
 
@@ -2469,17 +2574,21 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     struct hw_bp dbg_regs[16];
   };
 
+  // Also defined as mcontext_t in some headers
   struct __attribute((aligned(16))) sigcontext {
     __u64 fault_addr;
     user_pt_regs regs;
     // ISA extension state follows here
+    unsigned char __reserved[4096] __attribute((aligned(16)));
   };
 
+  // Also defined as ucontext_t in some headers
   struct ucontext {
     unsigned long	uc_flags;
     ptr<ucontext> uc_link;
     stack_t		  uc_stack;
     kernel_sigset_t	  uc_sigmask;
+    /* 128 bytes are reserved for the sigmask so reflect that here */
     uint8_t __unused1[1024 / 8 - sizeof(kernel_sigset_t)];
     struct sigcontext uc_mcontext;
   };
@@ -2514,6 +2623,17 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     uint32_t rule_locs[0];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::ethtool_rxnfc, struct ethtool_rxnfc);
+
+  struct user_pac_address_keys {
+    __uint128_t apiakey;
+    __uint128_t apibkey;
+    __uint128_t	apdakey;
+    __uint128_t apdbkey;
+  };
+
+  struct user_pac_generic_keys {
+    __uint128_t apgakey;
+  };
 };
 
 #define RR_ARCH_FUNCTION(f, arch, args...)                                     \
@@ -2582,6 +2702,13 @@ size_t sigaction_sigset_size(SupportedArch arch);
 
 size_t user_regs_struct_size(SupportedArch arch);
 size_t user_fpregs_struct_size(SupportedArch arch);
+
+/* Returns the number of bits necessary for this particular virtual address. */
+uint8_t virtual_address_size(SupportedArch arch, remote_ptr<void> ptr);
+/* Returns the number of bits supported by default on this architecture for
+ * *userspace* virtual addresses.
+ */
+uint8_t default_virtual_address_size(SupportedArch arch);
 
 #if defined(__i386__)
 typedef X86Arch NativeArch;

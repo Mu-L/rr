@@ -266,7 +266,7 @@ public:
    * to notify this session that the objects are dying.
    */
   void on_destroy(AddressSpace* vm);
-  virtual void on_destroy(Task* t);
+  void on_destroy(Task* t);
   void on_create(ThreadGroup* tg);
   void on_destroy(ThreadGroup* tg);
 
@@ -289,9 +289,8 @@ public:
   bool is_replaying() { return as_replay() != nullptr; }
   bool is_diversion() { return as_diversion() != nullptr; }
 
-  // Returns true if execution should be "visible", i.e. it's the main
+  // Indicate if execution should be "visible", i.e. it's the main
   // session of a recording or a replay whose output could be echoed.
-  bool visible_execution() const { return visible_execution_; }
   void set_visible_execution(bool visible) { visible_execution_ = visible; }
 
   virtual bool need_performance_counters() const { return true; }
@@ -349,7 +348,7 @@ public:
       new mapping.
       Returns an empty mapping if the tracee unexpectedly died.
    */
-  static const AddressSpace::Mapping& steal_mapping(
+  static AddressSpace::Mapping steal_mapping(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       MonitoredSharedMemory::shr_ptr monitored = nullptr);
 
@@ -405,6 +404,9 @@ public:
   uint32_t syscallbuf_fds_disabled_size() const {
     return syscallbuf_fds_disabled_size_;
   }
+  uint32_t syscallbuf_hdr_size() const {
+    return syscallbuf_hdr_size_;
+  }
 
   /* Bind the current process to the a CPU as specified in the session options
      or trace */
@@ -417,6 +419,13 @@ public:
   virtual int tracee_output_fd(int dflt) {
     return dflt;
   }
+
+  void set_intel_pt_enabled(bool intel_pt) { intel_pt_ = intel_pt; }
+  /* When this is true, we collect Intel PT traces during recording
+     or replay. */
+  bool intel_pt_enabled() const { return intel_pt_; }
+
+  virtual bool mark_stdio() const;
 
 protected:
   Session();
@@ -461,6 +470,7 @@ protected:
 
   int rrcall_base_;
   uint32_t syscallbuf_fds_disabled_size_;
+  uint32_t syscallbuf_hdr_size_;
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
 
   TicksSemantics ticks_semantics_;
@@ -477,6 +487,11 @@ protected:
    * True while the execution of this session is visible to users.
    */
   bool visible_execution_;
+
+  /**
+   * True while we're collecting Intel PT data.
+   */
+  bool intel_pt_;
 };
 
 } // namespace rr

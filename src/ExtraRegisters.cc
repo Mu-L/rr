@@ -4,6 +4,7 @@
 
 #include <string.h>
 
+#include "GdbServerRegister.h"
 #include "ReplayTask.h"
 #include "core.h"
 #include "log.h"
@@ -55,7 +56,7 @@ struct RegData {
       : offset(offset), size(size), xsave_feature_bit(-1) {}
 };
 
-static bool reg_in_range(GdbRegister regno, GdbRegister low, GdbRegister high,
+static bool reg_in_range(GdbServerRegister regno, GdbServerRegister low, GdbServerRegister high,
                          int offset_base, int offset_stride, int size,
                          RegData* out) {
   if (regno < low || regno > high) {
@@ -66,21 +67,95 @@ static bool reg_in_range(GdbRegister regno, GdbRegister low, GdbRegister high,
   return true;
 }
 
-static const int AVX_FEATURE_BIT = 2;
-static const int PKRU_FEATURE_BIT = 9;
+static constexpr int AVX_FEATURE_BIT = 2;
+static constexpr int AVX_OPMASK_FEATURE_BIT = 5;
+static constexpr int AVX_ZMM_HI256_FEATURE_BIT = 6;
+static constexpr int AVX_ZMM_HI16_FEATURE_BIT = 7;
+static constexpr int PKRU_FEATURE_BIT = 9;
 
 static const uint64_t PKRU_FEATURE_MASK = 1 << PKRU_FEATURE_BIT;
 
 static const size_t xsave_header_offset = 512;
 static const size_t xsave_header_size = 64;
 static const size_t xsave_header_end = xsave_header_offset + xsave_header_size;
-// This is always at 576 since AVX is always the first optional feature,
-// if present.
-static const size_t AVX_xsave_offset = 576;
+struct RegisterDescriptor {
+  // Feature bits given by CPUID
+  int8_t feature;
+  // Width in bytes in the xsave area
+  int8_t size;
+  // If the registers described by this descriptor is laid out in Hi16 ranges,
+  // value can be non-zero.
+  int8_t hi16_offset;
+  // Range of registers described by descriptor
+  GdbServerRegister base;
+  GdbServerRegister end_inclusive;
+  // The stride of the register (how far between the start of this register to
+  // the next register of the same type, in the xsave area)
+  int stride;
+
+  int register_offset(GdbServerRegister reg) const noexcept {
+    DEBUG_ASSERT(reg >= base && reg < (base + 16));
+    const auto& layout = xsave_native_layout();
+    return layout.feature_layouts[feature].offset + hi16_offset +
+           (reg - base) * stride;
+  }
+
+  bool describes_register(GdbServerRegister gdb_register) const {
+    // compare end first because we search table linerarly.
+    return gdb_register <= end_inclusive && gdb_register >= base;
+  }
+};
+
+/**
+ * These descriptors describe the layout of the XSAVE area for avx2 and
+ * avx512 extensions. where the actual contents for the registers get read from.
+ * `RegisterDescriptor::feature` is used to index into `XSaveFeatureLayout` to
+ * get the base offset for a particular range.
+ *
+ * Register ranges in the xsave area that differ is the Hi16 ones.
+ * In these ranges, the registers are laid out like [xmmN, ymmN, zmmN],
+ * instead of [xmm0..N], [ymm0..N]. So to get e.g. zmm18 we need 3 offsets;
+ * 1. offset to the sub-region of xsave for [xmmN, ymmN, zmmN] are found (N>15)
+ * 2. offset to where register-range N=18 begins, e.g. [xmm18, ymm18, zmm18]
+ * 3. offset to where zmm begins; which is 32 bytes.
+ */
+static constexpr std::array<RegisterDescriptor, 6> register_config_lookup_table{
+  { { AVX_FEATURE_BIT, 16, 0, DREG_64_YMM0H,
+      GdbServerRegister(DREG_64_YMM15H), 16 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 16, 0, DREG_64_XMM16,
+      GdbServerRegister(DREG_64_XMM31), 64 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 16, 16, DREG_64_YMM16H,
+      GdbServerRegister(DREG_64_YMM31H), 64 },
+    { AVX_ZMM_HI256_FEATURE_BIT, 32, 0, DREG_64_ZMM0H,
+      GdbServerRegister(DREG_64_ZMM15H), 32 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 32, 32, DREG_64_ZMM16H,
+      GdbServerRegister(DREG_64_ZMM31H), 64 },
+    { AVX_OPMASK_FEATURE_BIT, 8, 0, DREG_64_K0,
+      GdbServerRegister(DREG_64_K7), 8 } }
+};
+
+// Every range of registers (except K0-7) are 16 registers long. We use this
+// fact to build a lookup table, for the AVX2 and AVX512 registers.
+static bool reg_is_avx2_or_512(GdbServerRegister reg, RegData& out) noexcept {
+  if (reg < DREG_64_YMM0H || reg > DREG_64_K7) {
+    return false;
+  }
+
+  for (const auto& descriptor : register_config_lookup_table) {
+    if (descriptor.describes_register(reg)) {
+      out.xsave_feature_bit = descriptor.feature;
+      out.size = descriptor.size;
+      out.offset = descriptor.register_offset(reg);
+      return true;
+    }
+  }
+  FATAL() << "Unknown AVX512F register: " << reg;
+  return true;
+}
 
 // Return the size and data location of register |regno|.
 // If we can't read the register, returns -1 in 'offset'.
-static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
+static RegData xsave_register_data(SupportedArch arch, GdbServerRegister regno) {
   // Check regno is in range, and if it's 32-bit then convert it to the
   // equivalent 64-bit register.
   switch (arch) {
@@ -88,11 +163,19 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
       // Convert regno to the equivalent 64-bit version since the XSAVE layout
       // is compatible
       if (regno >= DREG_XMM0 && regno <= DREG_XMM7) {
-        regno = (GdbRegister)(regno - DREG_XMM0 + DREG_64_XMM0);
+        regno = (GdbServerRegister)(regno - DREG_XMM0 + DREG_64_XMM0);
         break;
       }
       if (regno >= DREG_YMM0H && regno <= DREG_YMM7H) {
-        regno = (GdbRegister)(regno - DREG_YMM0H + DREG_64_YMM0H);
+        regno = (GdbServerRegister)(regno - DREG_YMM0H + DREG_64_YMM0H);
+        break;
+      }
+      if (regno >= DREG_ZMM0H && regno <= DREG_ZMM7H) {
+        regno = (GdbServerRegister)(regno - DREG_ZMM0H + DREG_64_ZMM0H);
+        break;
+      }
+      if (regno >= DREG_K0 && regno <= DREG_K7) {
+        regno = (GdbServerRegister)(regno - DREG_K0 + DREG_64_K0);
         break;
       }
       if (regno == DREG_MXCSR) {
@@ -102,7 +185,7 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
       } else if (regno < DREG_FIRST_FXSAVE_REG || regno > DREG_LAST_FXSAVE_REG) {
         return RegData();
       } else {
-        regno = (GdbRegister)(regno - DREG_FIRST_FXSAVE_REG +
+        regno = (GdbServerRegister)(regno - DREG_FIRST_FXSAVE_REG +
                               DREG_64_FIRST_FXSAVE_REG);
       }
       break;
@@ -123,9 +206,7 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
     return result;
   }
 
-  if (reg_in_range(regno, DREG_64_YMM0H, DREG_64_YMM15H, AVX_xsave_offset, 16,
-                   16, &result)) {
-    result.xsave_feature_bit = AVX_FEATURE_BIT;
+  if (reg_is_avx2_or_512(regno, result)) {
     return result;
   }
 
@@ -176,7 +257,7 @@ static uint64_t* xsave_features(vector<uint8_t>& data) {
              : reinterpret_cast<uint64_t*>(data.data() + xsave_header_offset);
 }
 
-size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
+size_t ExtraRegisters::read_register(uint8_t* buf, GdbServerRegister regno,
                                      bool* defined) const {
   if (format_ == NT_FPR) {
     if (arch() != aarch64) {
@@ -234,7 +315,7 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
   return reg_data.size;
 }
 
-bool ExtraRegisters::write_register(GdbRegister regno, const void* value,
+bool ExtraRegisters::write_register(GdbServerRegister regno, const void* value,
                                     size_t value_size) {
   if (format_ == NT_FPR) {
     if (arch() != aarch64) {
@@ -379,12 +460,12 @@ void ExtraRegisters::validate(Task* t) {
   }
 }
 
-static size_t get_full_value(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
+static size_t get_full_value(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
                              uint8_t buf[128]) {
   bool defined = false;
   size_t len = r.read_register(buf, low, &defined);
   DEBUG_ASSERT(defined && len <= 64);
-  if (hi != GdbRegister(0)) {
+  if (hi != GdbServerRegister(0)) {
     size_t len2 = r.read_register(buf + len, hi, &defined);
     if (defined) {
       DEBUG_ASSERT(len == len2);
@@ -394,7 +475,7 @@ static size_t get_full_value(const ExtraRegisters& r, GdbRegister low, GdbRegist
   return len;
 }
 
-static string reg_to_string(const ExtraRegisters& r, GdbRegister low, GdbRegister hi) {
+static string reg_to_string(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi) {
   uint8_t buf[128];
   size_t len = get_full_value(r, low, hi, buf);
   bool printed_digit = false;
@@ -410,19 +491,19 @@ static string reg_to_string(const ExtraRegisters& r, GdbRegister low, GdbRegiste
   return out_buf;
 }
 
-static void print_reg(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
+static void print_reg(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
                       const char* name, FILE* f) {
   string out = reg_to_string(r, low, hi);
   fprintf(f, "%s:0x%s", name, out.c_str());
 }
 
-static void print_regs(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
+static void print_regs(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
                        int num_regs, const char* name_base, FILE* f) {
   for (int i = 0; i < num_regs; ++i) {
     char buf[80];
     sprintf(buf, "%s%d", name_base, i);
-    print_reg(r, (GdbRegister)(low + i),
-              hi == GdbRegister(0) ? hi : (GdbRegister)(hi + i), buf, f);
+    print_reg(r, (GdbServerRegister)(low + i),
+              hi == GdbServerRegister(0) ? hi : (GdbServerRegister)(hi + i), buf, f);
     if (i < num_regs - 1) {
       fputc(' ', f);
     }
@@ -432,22 +513,22 @@ static void print_regs(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
 void ExtraRegisters::print_register_file_compact(FILE* f) const {
   switch (arch_) {
     case x86:
-      print_regs(*this, DREG_ST0, GdbRegister(0), 8, "st", f);
+      print_regs(*this, DREG_ST0, GdbServerRegister(0), 8, "st", f);
       fputc(' ', f);
       print_regs(*this, DREG_XMM0, DREG_YMM0H, 8, "ymm", f);
       break;
     case x86_64:
-      print_regs(*this, DREG_64_ST0, GdbRegister(0), 8, "st", f);
+      print_regs(*this, DREG_64_ST0, GdbServerRegister(0), 8, "st", f);
       fputc(' ', f);
       print_regs(*this, DREG_64_XMM0, DREG_64_YMM0H, 16, "ymm", f);
       break;
     case aarch64:
       DEBUG_ASSERT(format_ == NT_FPR);
-      print_regs(*this, DREG_V0, GdbRegister(0), 32, "v", f);
+      print_regs(*this, DREG_V0, GdbServerRegister(0), 32, "v", f);
       fputc(' ', f);
-      print_reg(*this, DREG_FPSR, GdbRegister(0), "fpsr", f);
+      print_reg(*this, DREG_FPSR, GdbServerRegister(0), "fpsr", f);
       fputc(' ', f);
-      print_reg(*this, DREG_FPCR, GdbRegister(0), "fpcr", f);
+      print_reg(*this, DREG_FPCR, GdbServerRegister(0), "fpcr", f);
       break;
     default:
       DEBUG_ASSERT(0 && "Unknown arch");
@@ -745,7 +826,7 @@ void ExtraRegisters::set_user_fpxregs_struct(
   memcpy(data_.data(), &regs, sizeof(regs));
 }
 
-static void set_word(SupportedArch arch, vector<uint8_t>& v, GdbRegister r,
+static void set_word(SupportedArch arch, vector<uint8_t>& v, GdbServerRegister r,
                      int word) {
   RegData d = xsave_register_data(arch, r);
   DEBUG_ASSERT(d.size == 4);
@@ -800,15 +881,14 @@ void ExtraRegisters::reset() {
   }
 }
 
-static bool compare_regs(const char* label1, const ExtraRegisters& reg1,
-                         const char* label2, const ExtraRegisters& reg2,
-                         GdbRegister low, GdbRegister hi,
+static void compare_regs(const ExtraRegisters& reg1,
+                         const ExtraRegisters& reg2,
+                         GdbServerRegister low, GdbServerRegister hi,
                          int num_regs, const char* name_base,
-                         MismatchBehavior mismatch_behavior) {
-  bool match = true;
+                         Registers::Comparison& result) {
   for (int i = 0; i < num_regs; ++i) {
-    GdbRegister this_low = (GdbRegister)(low + i);
-    GdbRegister this_hi = hi == GdbRegister(0) ? hi : (GdbRegister)(hi + i);
+    GdbServerRegister this_low = (GdbServerRegister)(low + i);
+    GdbServerRegister this_hi = hi == GdbServerRegister(0) ? hi : (GdbServerRegister)(hi + i);
     uint8_t buf1[128];
     size_t len1 = get_full_value(reg1, this_low, this_hi, buf1);
     uint8_t buf2[128];
@@ -819,70 +899,47 @@ static bool compare_regs(const char* label1, const ExtraRegisters& reg1,
       continue;
     }
 
-    char regname[80];
-    sprintf(regname, "%s%d", name_base, i);
-    string val1 = reg_to_string(reg1, this_low, this_hi);
-    string val2 = reg_to_string(reg2, this_low, this_hi);
-    if (mismatch_behavior >= BAIL_ON_MISMATCH) {
-      LOG(error) << regname << " " << val1 << " != " << val2 << " ("
-                 << label1 << " vs. " << label2 << ")";
-    } else if (mismatch_behavior >= LOG_MISMATCHES) {
-      LOG(info) << regname << " " << val1 << " != " << val2 << " ("
-                << label1 << " vs. " << label2 << ")";
+    ++result.mismatch_count;
+    if (result.store_mismatches) {
+      char regname[80];
+      sprintf(regname, "%s%d", name_base, i);
+      result.mismatches.push_back({regname, reg_to_string(reg1, this_low, this_hi),
+          reg_to_string(reg2, this_low, this_hi)});
     }
-    match = false;
   }
-  return match;
 }
 
-bool ExtraRegisters::compare_register_files_internal(const char* name1,
-  const ExtraRegisters& reg1, const char* name2, const ExtraRegisters& reg2,
-  MismatchBehavior mismatch_behavior) {
-  switch (reg1.arch()) {
+void ExtraRegisters::compare_internal(const ExtraRegisters& reg2,
+  Registers::Comparison& result) const {
+  if (arch() != reg2.arch()) {
+    FATAL() << "Can't compare register files with different archs";
+  }
+
+  if (format() == NONE || reg2.format() == NONE) {
+    // Not enough data to check anything
+    return;
+  }
+  if (format() != reg2.format()) {
+    FATAL() << "Can't compare register files with different formats";
+  }
+
+  switch (arch()) {
     case x86:
-      return compare_regs(name1, reg1, name2, reg2, DREG_ST0, GdbRegister(0), 8, "st", mismatch_behavior)
-        && compare_regs(name1, reg1, name2, reg2, DREG_XMM0, DREG_YMM0H, 8, "ymm", mismatch_behavior);
+      compare_regs(*this, reg2, DREG_ST0, GdbServerRegister(0), 8, "st", result);
+      compare_regs(*this, reg2, DREG_XMM0, DREG_YMM0H, 8, "ymm", result);
+      break;
     case x86_64:
-      return compare_regs(name1, reg1, name2, reg2, DREG_64_ST0, GdbRegister(0), 8, "st", mismatch_behavior)
-        && compare_regs(name1, reg1, name2, reg2, DREG_64_XMM0, DREG_64_YMM0H, 8, "ymm", mismatch_behavior);
+      compare_regs(*this, reg2, DREG_64_ST0, GdbServerRegister(0), 8, "st", result);
+      compare_regs(*this, reg2, DREG_64_XMM0, DREG_64_YMM0H, 8, "ymm", result);
+      break;
     case aarch64:
-      DEBUG_ASSERT(reg1.format_ == NT_FPR);
-      return compare_regs(name1, reg1, name2, reg2, DREG_V0, GdbRegister(0), 32, "v", mismatch_behavior);
+      DEBUG_ASSERT(format_ == NT_FPR);
+      compare_regs(*this, reg2, DREG_V0, GdbServerRegister(0), 32, "v", result);
+      break;
     default:
       DEBUG_ASSERT(0 && "Unknown arch");
-      return true;
+      break;
   }
-}
-
-bool ExtraRegisters::compare_register_files(ReplayTask* t, const char* name1,
-                                            const ExtraRegisters& reg1, const char* name2,
-                                            const ExtraRegisters& reg2,
-                                            MismatchBehavior mismatch_behavior) {
-  ASSERT(t, reg1.arch() == reg2.arch()) << "Can't compare register files with different archs";
-  if (reg1.format() == NONE || reg2.format() == NONE) {
-    // Not enough data to check anything
-    return true;
-  }
-  ASSERT(t, reg1.format() == reg2.format()) << "Can't compare register files with different formats";
-
-  bool bail_error = mismatch_behavior >= BAIL_ON_MISMATCH;
-  bool match = compare_register_files_internal(name1, reg1, name2, reg2,
-                                               mismatch_behavior);
-
-  if (t) {
-    ASSERT(t, !bail_error || match)
-        << "Fatal extra-register mismatch (ticks/rec:" << t->tick_count() << "/"
-        << t->current_trace_frame().ticks() << ")";
-  } else {
-    DEBUG_ASSERT(!bail_error || match);
-  }
-
-  if (match && mismatch_behavior == LOG_MISMATCHES) {
-    LOG(info) << "(extra-register files are the same for " << name1 << " and "
-              << name2 << ")";
-  }
-
-  return match;
 }
 
 } // namespace rr

@@ -15,7 +15,7 @@ using namespace std;
 namespace rr {
 
 DiversionSession::DiversionSession(int cpu_binding) :
-  emu_fs(EmuFs::create()), fake_rdstc(uint64_t(1) << 60), cpu_binding_(cpu_binding) {}
+  emu_fs(EmuFs::create()), fake_timer_counter(uint64_t(1) << 60), cpu_binding_(cpu_binding) {}
 
 DiversionSession::~DiversionSession() {
   // We won't permanently leak any OS resources by not ensuring
@@ -50,10 +50,10 @@ static void execute_syscall(Task* t) {
   remote.regs().set_syscall_result(t->regs().syscall_result());
 }
 
-uint64_t DiversionSession::next_rdtsc_value() {
-  uint64_t rdtsc_value = fake_rdstc;
-  fake_rdstc += 1 << 20; // 1M cycles
-  return rdtsc_value;
+uint64_t DiversionSession::next_timer_counter() {
+  uint64_t value = fake_timer_counter;
+  fake_timer_counter += 1 << 20; // 1M cycles
+  return value;
 }
 
 template <typename Arch>
@@ -70,7 +70,7 @@ static void process_syscall_arch(Task* t, int syscallno) {
   }
 
   if (syscallno == t->session().syscall_number_for_rrcall_rdtsc()) {
-    uint64_t rdtsc_value = static_cast<DiversionSession*>(&t->session())->next_rdtsc_value();
+    uint64_t rdtsc_value = static_cast<DiversionSession*>(&t->session())->next_timer_counter();
     LOG(debug) << "Faking rrcall_rdtsc syscall with value " << rdtsc_value;
     remote_ptr<uint64_t> out_param(t->regs().arg1());
     t->write_mem(out_param, rdtsc_value);
@@ -157,18 +157,14 @@ static void process_syscall(Task* t, int syscallno){
   RR_ARCH_FUNCTION(process_syscall_arch, t->arch(), t, syscallno)
 }
 
-static void handle_ptrace_exit_event(Task *t) {
+static bool maybe_handle_task_exit(Task* t, TaskContext* context,
+                                   DiversionSession::DiversionResult* result) {
+  if (t->ptrace_event() != PTRACE_EVENT_EXIT && !t->was_reaped()) {
+    return false;
+  }
   t->did_kill();
   t->detach();
   delete t;
-}
-
-static bool maybe_handle_task_exit(Task* t, TaskContext* context,
-                                   DiversionSession::DiversionResult* result) {
-  if (t->ptrace_event() != PTRACE_EVENT_EXIT) {
-    return false;
-  }
-  handle_ptrace_exit_event(t);
   // This is now a dangling pointer, so clear it.
   context->task = nullptr;
   result->status = DiversionSession::DIVERSION_EXITED;
@@ -198,16 +194,20 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
 
   while (true) {
     switch (command) {
-      case RUN_CONTINUE:
+      case RUN_CONTINUE: {
         LOG(debug) << "Continuing to next syscall";
-        t->resume_execution(RESUME_SYSEMU, RESUME_WAIT, RESUME_UNLIMITED_TICKS,
-                            signal_to_deliver);
+        bool ok = t->resume_execution(RESUME_SYSEMU, RESUME_WAIT,
+                                      RESUME_UNLIMITED_TICKS, signal_to_deliver);
+        ASSERT(t, ok) << "Tracee was killed unexpectedly";
         break;
-      case RUN_SINGLESTEP:
+      }
+      case RUN_SINGLESTEP: {
         LOG(debug) << "Stepping to next insn/syscall";
-        t->resume_execution(RESUME_SYSEMU_SINGLESTEP, RESUME_WAIT,
-                           RESUME_UNLIMITED_TICKS, signal_to_deliver);
+        bool ok = t->resume_execution(RESUME_SYSEMU_SINGLESTEP, RESUME_WAIT,
+                                      RESUME_UNLIMITED_TICKS, signal_to_deliver);
+        ASSERT(t, ok) << "Tracee was killed unexpectedly";
         break;
+      }
       default:
         FATAL() << "Illegal run command " << command;
     }
@@ -227,15 +227,37 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
         result.break_status.signal = unique_ptr<siginfo_t>(new siginfo_t(t->get_siginfo()));
         result.break_status.signal->si_signo = t->stop_sig();
       } else if (t->stop_sig() == SIGSEGV) {
-        auto trapped_instruction = trapped_instruction_at(t, t->ip());
-        if (trapped_instruction == TrappedInstruction::RDTSC) {
-          size_t len = trapped_instruction_len(trapped_instruction);
-          uint64_t rdtsc_value = next_rdtsc_value();
+        auto special_instruction = special_instruction_at(t, t->ip());
+        if (special_instruction.opcode == SpecialInstOpcode::X86_RDTSC) {
+          size_t len = special_instruction_len(special_instruction.opcode);
+          uint64_t rdtsc_value = next_timer_counter();
           LOG(debug) << "Faking RDTSC instruction with value " << rdtsc_value;
           Registers r = t->regs();
           r.set_ip(r.ip() + len);
           r.set_ax((uint32_t)rdtsc_value);
           r.set_dx(rdtsc_value >> 32);
+          t->set_regs(r);
+          result.break_status = BreakStatus();
+          continue;
+        } else if (special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTVCT_EL0 ||
+                   special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTVCTSS_EL0) {
+          size_t len = special_instruction_len(special_instruction.opcode);
+          uint64_t cntvct_value = next_timer_counter();
+          Registers r = t->regs();
+          r.set_ip(r.ip() + len);
+          if (special_instruction.regno != 31) {
+            r.set_x(special_instruction.regno, cntvct_value);
+          }
+          t->set_regs(r);
+          result.break_status = BreakStatus();
+          continue;
+        } else if (special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTFRQ_EL0) {
+          size_t len = special_instruction_len(special_instruction.opcode);
+          Registers r = t->regs();
+          r.set_ip(r.ip() + len);
+          if (special_instruction.regno != 31) {
+            r.set_x(special_instruction.regno, cntfrq());
+          }
           t->set_regs(r);
           result.break_status = BreakStatus();
           continue;
